@@ -22,6 +22,8 @@ on:
         required: true
       DOCKERHUB_TOKEN:
         required: true
+      GH_BOT_USER_PAT:
+        required: false
 
 permissions:
   contents: write
@@ -115,6 +117,7 @@ jobs:
     outputs:
       is_release_created: ${{ steps.release_meta.outputs.is_release_created }}
       version: ${{ steps.release_meta.outputs.version }}
+      is_production_release: ${{ steps.release_meta.outputs.is_production_release }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -172,6 +175,7 @@ jobs:
             echo "is_release_created=false" >> "$GITHUB_OUTPUT"
           fi
           echo "version=${{ env.CHANGELOG_VERSION }}" >> "$GITHUB_OUTPUT"
+          echo "is_production_release=${{ steps.changelog.outputs.isProductionRelease }}" >> "$GITHUB_OUTPUT"
 
   prepare-pypi-publish:
     runs-on: ubuntu-latest
@@ -309,3 +313,24 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  trigger-docs-sync:
+    runs-on: ubuntu-latest
+    needs: [create-release, publish-docker]
+    if: needs.create-release.outputs.is_release_created == 'true' && needs.publish-docker.result == 'success'
+    steps:
+      - name: Trigger docs sync dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
+        shell: bash
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "GH_BOT_USER_PAT not provided, skipping docs sync dispatch."
+            exit 0
+          fi
+
+          gh api repos/PlainsightAI/gh-actions/dispatches \
+            -f event_type=sync-filter-docs \
+            -f "client_payload[repository]=${{ github.repository }}" \
+            -f "client_payload[tag]=${{ needs.create-release.outputs.version }}" \
+            -f "client_payload[is_production_release]=${{ needs.create-release.outputs.is_production_release }}"
