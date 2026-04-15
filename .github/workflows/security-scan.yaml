@@ -1,0 +1,86 @@
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      python_versions:
+        description: JSON array of Python versions to scan
+        required: false
+        type: string
+        default: '["3.10", "3.11", "3.12", "3.13"]'
+      grype_version:
+        description: Grype version to use
+        required: false
+        type: string
+        default: v0.103.0
+      fail_on:
+        description: Severity threshold to fail on (critical, high, medium, low)
+        required: false
+        type: string
+        default: critical
+      filter_name:
+        description: Name passed to Grype --name (defaults to repository name)
+        required: false
+        type: string
+      gcloud_auth:
+        description: Enable GCloud auth for private dependency installation (premium/private filters)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  grype:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ${{ fromJSON(inputs.python_versions) }}
+    steps:
+      - name: "PreAction Disk-Cleanup"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a --force
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Authenticate to Google Cloud
+        if: inputs.gcloud_auth
+        uses: PlainsightAI/gh-actions/google-cloud-auth@main
+        with:
+          environment: production
+
+      - name: Create virtual environment and install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          make install
+
+      - name: Resolve filter name
+        id: filter_name
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.filter_name }}" ]]; then
+            echo "name=${{ inputs.filter_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Grype
+        uses: anchore/scan-action/download-grype@v3
+        id: grype
+        with:
+          grype-version: ${{ inputs.grype_version }}
+
+      - name: Run Grype security scan
+        run: ${{ steps.grype.outputs.cmd }} --name ${{ steps.filter_name.outputs.name }} -o table --fail-on ${{ inputs.fail_on }} --only-fixed dir:.
