@@ -22,6 +22,11 @@ on:
         description: Name passed to Grype --name (defaults to repository name)
         required: false
         type: string
+      only_fixed:
+        description: Only report vulnerabilities with known fixes
+        required: false
+        type: boolean
+        default: true
       gcloud_auth:
         description: Enable GCloud auth for private dependency installation (premium/private filters)
         required: false
@@ -69,12 +74,15 @@ jobs:
       - name: Resolve filter name
         id: filter_name
         shell: bash
+        env:
+          RAW_FILTER_NAME: ${{ inputs.filter_name }}
         run: |
-          if [[ -n "${{ inputs.filter_name }}" ]]; then
-            echo "name=${{ inputs.filter_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          name="${RAW_FILTER_NAME:-${GITHUB_REPOSITORY##*/}}"
+          if [[ "$name" == *$'\n'* || "$name" == *$'\r'* ]]; then
+            echo "Invalid filter_name: must not contain newline characters" >&2
+            exit 1
           fi
+          printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
 
       - name: Download Grype
         uses: anchore/scan-action/download-grype@v3
@@ -83,4 +91,15 @@ jobs:
           grype-version: ${{ inputs.grype_version }}
 
       - name: Run Grype security scan
-        run: ${{ steps.grype.outputs.cmd }} --name ${{ steps.filter_name.outputs.name }} -o table --fail-on ${{ inputs.fail_on }} --only-fixed dir:.
+        shell: bash
+        env:
+          GRYPE_CMD: ${{ steps.grype.outputs.cmd }}
+          GRYPE_NAME: ${{ steps.filter_name.outputs.name }}
+          FAIL_ON: ${{ inputs.fail_on }}
+          ONLY_FIXED: ${{ inputs.only_fixed }}
+        run: |
+          args=(--name "$GRYPE_NAME" -o table --fail-on "$FAIL_ON")
+          if [[ "$ONLY_FIXED" == "true" ]]; then
+            args+=(--only-fixed)
+          fi
+          "$GRYPE_CMD" "${args[@]}" dir:.
