@@ -61,9 +61,14 @@ jobs:
 
       - name: Authenticate to Google Cloud
         if: inputs.gcloud_auth
-        uses: PlainsightAI/gh-actions/google-cloud-auth@main
+        uses: google-github-actions/auth@v3
         with:
-          environment: production
+          workload_identity_provider: projects/676115004559/locations/global/workloadIdentityPools/gh-actions-pool/providers/gh-actions-provider
+          service_account: gh-actions-svc-account@plainsightai-prod.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        if: inputs.gcloud_auth
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Create virtual environment and install dependencies
         run: |
