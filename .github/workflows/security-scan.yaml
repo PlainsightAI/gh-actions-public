@@ -59,7 +59,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Authenticate to Google Cloud (WIF)
+      - name: Authenticate to Google Cloud
         if: inputs.gcloud_auth
         uses: google-github-actions/auth@v3
         with:
