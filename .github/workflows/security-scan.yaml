@@ -63,8 +63,8 @@ jobs:
         if: inputs.gcloud_auth
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: projects/676115004559/locations/global/workloadIdentityPools/gh-actions-pool/providers/gh-actions-provider
-          service_account: gh-actions-svc-account@plainsightai-prod.iam.gserviceaccount.com
+          workload_identity_provider: ${{ vars.GCLOUD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCLOUD_GITHUB_CI_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Cloud SDK
         if: inputs.gcloud_auth
