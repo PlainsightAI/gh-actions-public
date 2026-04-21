@@ -152,6 +152,9 @@ jobs:
 
           # Merge ignore entries
           existing_ignores = config.get("ignore") or []
+          if not isinstance(existing_ignores, list):
+              print(f"WARNING: .grype.yaml 'ignore' key is {type(existing_ignores).__name__}, expected list — overwriting", file=sys.stderr)
+              existing_ignores = []
           existing_ignores.extend({"vulnerability": e} for e in entries)
           config["ignore"] = existing_ignores
 
