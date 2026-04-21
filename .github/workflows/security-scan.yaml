@@ -27,6 +27,15 @@ on:
         required: false
         type: boolean
         default: true
+      ignore_cves:
+        description: >-
+          Comma-separated CVE/GHSA IDs to ignore. These are written to a
+          temporary .grype.yaml before the scan. The default ignores CVEs
+          in transitive dependencies (e.g. ffmpeg bundled inside
+          opencv-python-headless) that have no upstream fix yet.
+        required: false
+        type: string
+        default: 'CVE-2026-40962'
       gcloud_auth:
         description: Enable GCloud auth for private dependency installation (premium/private filters)
         required: false
@@ -95,6 +104,21 @@ jobs:
         id: grype
         with:
           grype-version: ${{ inputs.grype_version }}
+
+      - name: Configure Grype ignores
+        if: inputs.ignore_cves != ''
+        shell: bash
+        env:
+          IGNORE_CVES: ${{ inputs.ignore_cves }}
+        run: |
+          echo "ignore:" > .grype.yaml
+          IFS=',' read -ra CVES <<< "$IGNORE_CVES"
+          for cve in "${CVES[@]}"; do
+            trimmed="${cve// /}"
+            echo "  - vulnerability: $trimmed" >> .grype.yaml
+          done
+          echo "Generated .grype.yaml:"
+          cat .grype.yaml
 
       - name: Run Grype security scan
         shell: bash
