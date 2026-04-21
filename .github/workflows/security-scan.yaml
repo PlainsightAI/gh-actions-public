@@ -111,44 +111,76 @@ jobs:
         env:
           IGNORE_CVES: ${{ inputs.ignore_cves }}
         run: |
-          # Write workflow ignores to a separate config file to avoid
-          # clobbering or producing invalid YAML if the repo already
-          # ships its own .grype.yaml (Grype's --config flag overrides
-          # config-file discovery, so we merge both sources here).
+          # Write workflow ignores to a separate config file using a
+          # YAML-aware merge (via Python's built-in yaml-safe subset)
+          # so that appending ignore entries is correct regardless of
+          # key ordering in an existing .grype.yaml.
           cfg="/tmp/grype-workflow.yaml"
 
-          # Start from the repo's config if one exists
-          if [[ -f .grype.yaml ]]; then
-            echo "Found existing .grype.yaml — merging with workflow ignores"
-            cp .grype.yaml "$cfg"
-            if ! grep -q '^ignore:' "$cfg"; then
-              printf '\nignore:\n' >> "$cfg"
-            fi
-          else
-            echo "ignore:" > "$cfg"
-          fi
+          python3 - "$cfg" <<'PYEOF'
+          import json, re, sys, os
 
-          IFS=',' read -ra CVES <<< "$IGNORE_CVES"
-          for cve in "${CVES[@]}"; do
-            trimmed="${cve// /}"
-            # Skip empty entries (trailing/consecutive commas)
-            [[ -z "$trimmed" ]] && continue
-            # Reject control characters
-            if [[ "$trimmed" == *$'\n'* || "$trimmed" == *$'\r'* ]] || [[ "$trimmed" =~ [[:cntrl:]] ]]; then
-              echo "Invalid ignore_cves entry '$trimmed': must not contain control characters" >&2
-              exit 1
-            fi
-            # Validate CVE-YYYY-NNNN or GHSA-xxxx-xxxx-xxxx format
-            if [[ ! "$trimmed" =~ ^CVE-[0-9]{4}-[0-9]+$ && ! "$trimmed" =~ ^GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$ ]]; then
-              echo "Invalid ignore_cves entry '$trimmed': expected CVE-YYYY-NNNN... or GHSA-xxxx-xxxx-xxxx" >&2
-              exit 1
-            fi
-            echo "  - vulnerability: $trimmed" >> "$cfg"
-          done
+          cfg_path = sys.argv[1]
+          ignore_cves = os.environ["IGNORE_CVES"]
+
+          # Parse and validate entries
+          CVE_RE = re.compile(r"^CVE-\d{4}-\d+$")
+          GHSA_RE = re.compile(r"^GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$")
+
+          entries = []
+          for raw in ignore_cves.split(","):
+              trimmed = raw.strip()
+              if not trimmed:
+                  continue
+              if any(c in trimmed for c in "\n\r") or not trimmed.isprintable():
+                  print(f"Invalid ignore_cves entry '{trimmed}': must not contain control characters", file=sys.stderr)
+                  sys.exit(1)
+              if not CVE_RE.match(trimmed) and not GHSA_RE.match(trimmed):
+                  print(f"Invalid ignore_cves entry '{trimmed}': expected CVE-YYYY-NNNN... or GHSA-xxxx-xxxx-xxxx", file=sys.stderr)
+                  sys.exit(1)
+              entries.append(trimmed)
+
+          if not entries:
+              sys.exit(0)
+
+          # Load existing config or start fresh (pure-Python, no PyYAML needed —
+          # .grype.yaml is simple enough for json-style roundtrip via the stdlib
+          # yaml is not in stdlib, so we do a safe line-level merge).
+          import io
+
+          existing_lines: list[str] = []
+          if os.path.isfile(".grype.yaml"):
+              print("Found existing .grype.yaml — merging with workflow ignores")
+              with open(".grype.yaml") as f:
+                  existing_lines = f.readlines()
+
+          # Find the ignore: key position, or append one
+          ignore_idx = None
+          for i, line in enumerate(existing_lines):
+              if line.rstrip() == "ignore:":
+                  ignore_idx = i
+                  break
+
+          new_lines = [f"  - vulnerability: {e}\n" for e in entries]
+
+          if ignore_idx is not None:
+              # Insert after the ignore: key and any existing entries
+              insert_at = ignore_idx + 1
+              while insert_at < len(existing_lines) and existing_lines[insert_at].startswith("  "):
+                  insert_at += 1
+              for j, nl in enumerate(new_lines):
+                  existing_lines.insert(insert_at + j, nl)
+          else:
+              existing_lines.append("ignore:\n")
+              existing_lines.extend(new_lines)
+
+          with open(cfg_path, "w") as f:
+              f.writelines(existing_lines)
+
+          print(f"Added {len(entries)} ignore(s): {', '.join(entries)}")
+          PYEOF
 
           echo "GRYPE_CONFIG=$cfg" >> "$GITHUB_ENV"
-          echo "Final Grype config ($cfg):"
-          cat "$cfg"
 
       - name: Run Grype security scan
         shell: bash
