@@ -111,16 +111,23 @@ jobs:
         env:
           IGNORE_CVES: ${{ inputs.ignore_cves }}
         run: |
-          # Preserve any existing .grype.yaml from the repo and append ignores
+          # Write workflow ignores to a separate config file to avoid
+          # clobbering or producing invalid YAML if the repo already
+          # ships its own .grype.yaml (Grype's --config flag overrides
+          # config-file discovery, so we merge both sources here).
+          cfg="/tmp/grype-workflow.yaml"
+
+          # Start from the repo's config if one exists
           if [[ -f .grype.yaml ]]; then
-            echo "Found existing .grype.yaml — appending workflow ignores"
-            # Ensure ignore: key exists; if not, add it
-            if ! grep -q '^ignore:' .grype.yaml; then
-              echo "ignore:" >> .grype.yaml
+            echo "Found existing .grype.yaml — merging with workflow ignores"
+            cp .grype.yaml "$cfg"
+            if ! grep -q '^ignore:' "$cfg"; then
+              printf '\nignore:\n' >> "$cfg"
             fi
           else
-            echo "ignore:" > .grype.yaml
+            echo "ignore:" > "$cfg"
           fi
+
           IFS=',' read -ra CVES <<< "$IGNORE_CVES"
           for cve in "${CVES[@]}"; do
             trimmed="${cve// /}"
@@ -131,15 +138,17 @@ jobs:
               echo "Invalid ignore_cves entry '$trimmed': must not contain control characters" >&2
               exit 1
             fi
-            # Validate CVE/GHSA format
-            if [[ ! "$trimmed" =~ ^CVE-[0-9]{4}-[0-9]+$ && ! "$trimmed" =~ ^GHSA-[A-Za-z0-9-]+$ ]]; then
-              echo "Invalid ignore_cves entry '$trimmed': expected CVE-YYYY-NNNN... or GHSA-..." >&2
+            # Validate CVE-YYYY-NNNN or GHSA-xxxx-xxxx-xxxx format
+            if [[ ! "$trimmed" =~ ^CVE-[0-9]{4}-[0-9]+$ && ! "$trimmed" =~ ^GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$ ]]; then
+              echo "Invalid ignore_cves entry '$trimmed': expected CVE-YYYY-NNNN... or GHSA-xxxx-xxxx-xxxx" >&2
               exit 1
             fi
-            echo "  - vulnerability: $trimmed" >> .grype.yaml
+            echo "  - vulnerability: $trimmed" >> "$cfg"
           done
-          echo "Final .grype.yaml:"
-          cat .grype.yaml
+
+          echo "GRYPE_CONFIG=$cfg" >> "$GITHUB_ENV"
+          echo "Final Grype config ($cfg):"
+          cat "$cfg"
 
       - name: Run Grype security scan
         shell: bash
@@ -152,5 +161,8 @@ jobs:
           args=(--name "$GRYPE_NAME" -o table --fail-on "$FAIL_ON")
           if [[ "$ONLY_FIXED" == "true" ]]; then
             args+=(--only-fixed)
+          fi
+          if [[ -n "${GRYPE_CONFIG:-}" ]]; then
+            args+=(--config "$GRYPE_CONFIG")
           fi
           "$GRYPE_CMD" "${args[@]}" dir:.
