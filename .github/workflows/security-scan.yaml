@@ -27,6 +27,18 @@ on:
         required: false
         type: boolean
         default: true
+      ignore_cves:
+        description: >-
+          Comma-separated CVE/GHSA IDs to ignore. Merged into a temporary
+          Grype config passed via --config (the repo's own .grype.yaml is
+          read but never modified). The default ignores CVEs in transitive
+          dependencies (e.g. ffmpeg bundled inside opencv-python-headless)
+          that have no upstream fix yet.
+        required: false
+        type: string
+        # TODO: remove default once opencv-python-headless ships ffmpeg >= 8.1
+        # Tracked at: https://github.com/PlainsightAI/openfilter/issues/84
+        default: 'CVE-2026-40962'
       gcloud_auth:
         description: Enable GCloud auth for private dependency installation (premium/private filters)
         required: false
@@ -96,6 +108,66 @@ jobs:
         with:
           grype-version: ${{ inputs.grype_version }}
 
+      - name: Configure Grype ignores
+        if: inputs.ignore_cves != ''
+        shell: bash
+        env:
+          IGNORE_CVES: ${{ inputs.ignore_cves }}
+        run: |
+          python -m pip install --quiet PyYAML
+          cfg="/tmp/grype-workflow.yaml"
+
+          python - "$cfg" <<'PYEOF'
+          import re, sys, os, yaml
+
+          cfg_path = sys.argv[1]
+          ignore_cves = os.environ["IGNORE_CVES"]
+
+          # Parse and validate entries
+          CVE_RE = re.compile(r"^CVE-\d{4}-\d+$")
+          GHSA_RE = re.compile(r"^GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$")
+
+          entries = []
+          for raw in ignore_cves.split(","):
+              trimmed = raw.strip()
+              if not trimmed:
+                  continue
+              if not trimmed.isprintable():
+                  print(f"Invalid ignore_cves entry '{trimmed}': must not contain control characters", file=sys.stderr)
+                  sys.exit(1)
+              if not CVE_RE.match(trimmed) and not GHSA_RE.match(trimmed):
+                  print(f"Invalid ignore_cves entry '{trimmed}': expected CVE-YYYY-NNNN... or GHSA-xxxx-xxxx-xxxx", file=sys.stderr)
+                  sys.exit(1)
+              entries.append(trimmed)
+
+          if not entries:
+              sys.exit(0)
+
+          # Load existing config or start fresh
+          config = {}
+          if os.path.isfile(".grype.yaml"):
+              print("Found existing .grype.yaml — merging with workflow ignores")
+              with open(".grype.yaml") as f:
+                  config = yaml.safe_load(f) or {}
+
+          # Merge ignore entries
+          existing_ignores = config.get("ignore") or []
+          if not isinstance(existing_ignores, list):
+              print(f"WARNING: .grype.yaml 'ignore' key is {type(existing_ignores).__name__}, expected list — overwriting", file=sys.stderr)
+              existing_ignores = []
+          existing_ignores.extend({"vulnerability": e} for e in entries)
+          config["ignore"] = existing_ignores
+
+          with open(cfg_path, "w") as f:
+              yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
+          print(f"Added {len(entries)} ignore(s): {', '.join(entries)}")
+          PYEOF
+
+          if [[ -f "$cfg" ]]; then
+            echo "GRYPE_CONFIG=$cfg" >> "$GITHUB_ENV"
+          fi
+
       - name: Run Grype security scan
         shell: bash
         env:
@@ -107,5 +179,8 @@ jobs:
           args=(--name "$GRYPE_NAME" -o table --fail-on "$FAIL_ON")
           if [[ "$ONLY_FIXED" == "true" ]]; then
             args+=(--only-fixed)
+          fi
+          if [[ -n "${GRYPE_CONFIG:-}" ]]; then
+            args+=(--config "$GRYPE_CONFIG")
           fi
           "$GRYPE_CMD" "${args[@]}" dir:.
