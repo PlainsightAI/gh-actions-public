@@ -118,7 +118,7 @@ jobs:
           cfg="/tmp/grype-workflow.yaml"
 
           python3 - "$cfg" <<'PYEOF'
-          import json, re, sys, os
+          import re, sys, os
 
           cfg_path = sys.argv[1]
           ignore_cves = os.environ["IGNORE_CVES"]
@@ -143,27 +143,28 @@ jobs:
           if not entries:
               sys.exit(0)
 
-          # Load existing config or start fresh (pure-Python, no PyYAML needed —
-          # .grype.yaml is simple enough for json-style roundtrip via the stdlib
-          # yaml is not in stdlib, so we do a safe line-level merge).
-          import io
-
-          existing_lines: list[str] = []
+          # Load existing config or start fresh
+          existing_lines = []
           if os.path.isfile(".grype.yaml"):
               print("Found existing .grype.yaml — merging with workflow ignores")
               with open(".grype.yaml") as f:
                   existing_lines = f.readlines()
 
-          # Find the ignore: key position, or append one
+          # Match ignore: key in common YAML forms:
+          #   "ignore:", "ignore: []", "ignore:  # comment", etc.
+          IGNORE_KEY_RE = re.compile(r"^ignore:\s*(\[\s*\])?\s*(#.*)?$")
+
           ignore_idx = None
           for i, line in enumerate(existing_lines):
-              if line.rstrip() == "ignore:":
+              if IGNORE_KEY_RE.match(line):
                   ignore_idx = i
                   break
 
           new_lines = [f"  - vulnerability: {e}\n" for e in entries]
 
           if ignore_idx is not None:
+              # Rewrite the key line to block form if it was "ignore: []"
+              existing_lines[ignore_idx] = "ignore:\n"
               # Insert after the ignore: key and any existing entries
               insert_at = ignore_idx + 1
               while insert_at < len(existing_lines) and existing_lines[insert_at].startswith("  "):
