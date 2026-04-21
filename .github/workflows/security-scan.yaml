@@ -114,10 +114,10 @@ jobs:
         env:
           IGNORE_CVES: ${{ inputs.ignore_cves }}
         run: |
-          pip install -q pyyaml 2>/dev/null || true
+          python -m pip install --quiet PyYAML
           cfg="/tmp/grype-workflow.yaml"
 
-          python3 - "$cfg" <<'PYEOF'
+          python - "$cfg" <<'PYEOF'
           import re, sys, os, yaml
 
           cfg_path = sys.argv[1]
