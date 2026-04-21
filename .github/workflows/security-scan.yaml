@@ -111,13 +111,34 @@ jobs:
         env:
           IGNORE_CVES: ${{ inputs.ignore_cves }}
         run: |
-          echo "ignore:" > .grype.yaml
+          # Preserve any existing .grype.yaml from the repo and append ignores
+          if [[ -f .grype.yaml ]]; then
+            echo "Found existing .grype.yaml — appending workflow ignores"
+            # Ensure ignore: key exists; if not, add it
+            if ! grep -q '^ignore:' .grype.yaml; then
+              echo "ignore:" >> .grype.yaml
+            fi
+          else
+            echo "ignore:" > .grype.yaml
+          fi
           IFS=',' read -ra CVES <<< "$IGNORE_CVES"
           for cve in "${CVES[@]}"; do
             trimmed="${cve// /}"
+            # Skip empty entries (trailing/consecutive commas)
+            [[ -z "$trimmed" ]] && continue
+            # Reject control characters
+            if [[ "$trimmed" == *$'\n'* || "$trimmed" == *$'\r'* ]] || [[ "$trimmed" =~ [[:cntrl:]] ]]; then
+              echo "Invalid ignore_cves entry '$trimmed': must not contain control characters" >&2
+              exit 1
+            fi
+            # Validate CVE/GHSA format
+            if [[ ! "$trimmed" =~ ^CVE-[0-9]{4}-[0-9]+$ && ! "$trimmed" =~ ^GHSA-[A-Za-z0-9-]+$ ]]; then
+              echo "Invalid ignore_cves entry '$trimmed': expected CVE-YYYY-NNNN... or GHSA-..." >&2
+              exit 1
+            fi
             echo "  - vulnerability: $trimmed" >> .grype.yaml
           done
-          echo "Generated .grype.yaml:"
+          echo "Final .grype.yaml:"
           cat .grype.yaml
 
       - name: Run Grype security scan
