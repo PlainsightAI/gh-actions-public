@@ -29,12 +29,15 @@ on:
         default: true
       ignore_cves:
         description: >-
-          Comma-separated CVE/GHSA IDs to ignore. These are written to a
-          temporary .grype.yaml before the scan. The default ignores CVEs
-          in transitive dependencies (e.g. ffmpeg bundled inside
-          opencv-python-headless) that have no upstream fix yet.
+          Comma-separated CVE/GHSA IDs to ignore. Merged into a temporary
+          Grype config passed via --config (the repo's own .grype.yaml is
+          read but never modified). The default ignores CVEs in transitive
+          dependencies (e.g. ffmpeg bundled inside opencv-python-headless)
+          that have no upstream fix yet.
         required: false
         type: string
+        # TODO: remove default once opencv-python-headless ships ffmpeg >= 8.1
+        # Tracked at: https://github.com/PlainsightAI/openfilter/issues/84
         default: 'CVE-2026-40962'
       gcloud_auth:
         description: Enable GCloud auth for private dependency installation (premium/private filters)
@@ -158,7 +161,9 @@ jobs:
           print(f"Added {len(entries)} ignore(s): {', '.join(entries)}")
           PYEOF
 
-          echo "GRYPE_CONFIG=$cfg" >> "$GITHUB_ENV"
+          if [[ -f "$cfg" ]]; then
+            echo "GRYPE_CONFIG=$cfg" >> "$GITHUB_ENV"
+          fi
 
       - name: Run Grype security scan
         shell: bash
