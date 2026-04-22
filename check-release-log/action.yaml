@@ -1,0 +1,170 @@
+name: "Check Release Log"
+description: "Ensures that RELEASE.md is updated, validates its format, checks VERSION consistency, and verifies VERSION is not behind the base branch."
+
+inputs:
+  source-paths:
+    description: |
+      Optional newline-separated glob patterns considered substantive changes
+      for the release-log check. When set, check-release-log is a no-op if
+      the PR touches none of these paths. When unset, every PR to main must
+      update RELEASE.md (existing behavior).
+
+      Do NOT include RELEASE.md itself — the downstream step already checks
+      that, and including it here creates a tautology where every RELEASE.md
+      edit satisfies the gate regardless of substantive change.
+    required: false
+    default: ''
+  ignore-paths:
+    description: |
+      Optional newline-separated glob patterns of paths that do NOT count as
+      substantive for the release-log check. When set, check-release-log is
+      a no-op if the PR changes ONLY files matching these globs. Can be
+      combined with source-paths; both filters apply.
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect substantive changes
+      id: detect
+      if: inputs.source-paths != '' || inputs.ignore-paths != ''
+      uses: tj-actions/changed-files@v47
+      with:
+        files: ${{ inputs.source-paths }}
+        files_ignore: ${{ inputs.ignore-paths }}
+
+    # Intentionally unconditional: every downstream step reads this step's
+    # `run` output to decide whether to gate itself, so this step must always
+    # execute even when `detect` was skipped (both inputs unset → SUBSTANTIVE_CHANGED
+    # empty → fall through to run=true, preserving legacy behavior).
+    - name: Decide whether to run
+      id: should_run
+      env:
+        SOURCE_PATHS: ${{ inputs.source-paths }}
+        IGNORE_PATHS: ${{ inputs.ignore-paths }}
+        SUBSTANTIVE_CHANGED: ${{ steps.detect.outputs.any_changed }}
+      run: |
+        # NOTE: `any_changed` is a string output from tj-actions/changed-files;
+        # the literal 'true' comparison is intentional. Don't refactor to a
+        # native boolean test — the output's name suggests boolean semantics
+        # but the value is a string ("true"/"false").
+        if [[ ( -n "$SOURCE_PATHS" || -n "$IGNORE_PATHS" ) && "$SUBSTANTIVE_CHANGED" != "true" ]]; then
+          echo "No substantive changes detected; skipping release log check."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        fi
+      shell: bash
+
+    - name: Get RELEASE.md file
+      if: steps.should_run.outputs.run == 'true'
+      id: changed_files
+      uses: tj-actions/changed-files@v47
+      with:
+        files: RELEASE.md
+
+    - name: Exit if release file is not updated
+      if: steps.should_run.outputs.run == 'true' && steps.changed_files.outputs.any_changed == 'false'
+      run: |
+        echo "❌ RELEASE.md must be updated on every PR to main."
+        exit 1
+      shell: bash
+
+    - name: Parse Changelog Entry
+      if: steps.should_run.outputs.run == 'true'
+      id: changelog
+      # PUBLIC standalone repo, not PlainsightAI/gh-actions/changelog-parser.
+      # Fork PRs on the restricted GITHUB_TOKEN can't read internal repos, and
+      # the internal reusable workflows in PlainsightAI/gh-actions (PR #75) are
+      # being refactored to uses: this composite — so an internal-repo ref here
+      # would also break the internal→public hop on that path. Public standalone
+      # keeps both resolution paths green. API-compatible with the pre-refactor
+      # inline reference in filter-release.yaml.
+      uses: PlainsightAI/changelog-parser-action@main
+      with:
+        path: RELEASE.md
+
+    - name: Store Changelog Version
+      if: steps.should_run.outputs.run == 'true'
+      run: echo "CHANGELOG_VERSION=${{ steps.changelog.outputs.version }}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Check VERSION file (if exists)
+      if: steps.should_run.outputs.run == 'true'
+      id: version_check
+      run: |
+        if [[ -f "VERSION" ]]; then
+          VERSION_FILE=$(cat VERSION | tr -d '[:space:]')
+          echo "VERSION file: $VERSION_FILE"
+          echo "Changelog version: $CHANGELOG_VERSION"
+
+          if [[ "$VERSION_FILE" != "$CHANGELOG_VERSION" ]]; then
+            echo "❌ VERSION mismatch! VERSION file: $VERSION_FILE, RELEASE.md: $CHANGELOG_VERSION"
+            exit 1
+          else
+            echo "✅ VERSION matches!"
+          fi
+        else
+          echo "No VERSION file found, skipping version check."
+        fi
+      shell: bash
+
+    - name: Check VERSION is not behind base branch
+      if: steps.should_run.outputs.run == 'true'
+      # BASE_REF is set via env: to avoid shell injection — never interpolate
+      # ${{ github.base_ref }} directly into a run: script (branch names can
+      # contain shell metacharacters that would be executed as code).
+      env:
+        BASE_REF: ${{ github.base_ref || 'main' }}
+      run: |
+        if ! git fetch origin "$BASE_REF"; then
+          echo "ERROR: Failed to fetch '${BASE_REF}' from origin. Cannot perform version comparison."
+          exit 1
+        fi
+
+        # Avoid piping git-show directly into tr — with pipefail (GitHub
+        # Actions composite step default), a non-zero exit from git-show
+        # kills the pipeline before the ${VAR:-0.0.0} fallback can fire.
+        # Capture first, transform second.
+        BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:VERSION" 2>/dev/null || true)
+        BASE_VERSION=$(printf '%s' "$BASE_VERSION_RAW" | tr -d '[:space:]v')
+        BASE_VERSION="${BASE_VERSION:-0.0.0}"
+
+        PR_VERSION_RAW=$(cat VERSION 2>/dev/null || true)
+        PR_VERSION=$(printf '%s' "$PR_VERSION_RAW" | tr -d '[:space:]v')
+        PR_VERSION="${PR_VERSION:-0.0.0}"
+
+        echo "Base branch (${BASE_REF}) VERSION: v${BASE_VERSION}"
+        echo "PR branch VERSION:                 v${PR_VERSION}"
+
+        if [[ "$BASE_VERSION" == "0.0.0" ]]; then
+          echo "No VERSION file on base branch, skipping base version check."
+          exit 0
+        fi
+
+        if [[ "$PR_VERSION" == "0.0.0" ]]; then
+          echo "No VERSION file on PR branch, skipping base version check."
+          exit 0
+        fi
+
+        # skip non-plain versions (pre-release or build-metadata) -- sort -V does
+        # not handle pre-release identifier ordering correctly per semver spec.
+        if [[ "$BASE_VERSION" == *[-+]* || "$PR_VERSION" == *[-+]* ]]; then
+          echo "Pre-release or build-metadata version detected -- skipping base version check."
+          exit 0
+        fi
+
+        # sort -V: handles numeric segment comparison (0.9 < 0.10) correctly for X.Y.Z.
+        # Pass when PR == base (already up to date) or PR > base (version bumped).
+        # Fail only when base is strictly newer than PR (stale branch).
+        LATEST=$(printf '%s\n' "$BASE_VERSION" "$PR_VERSION" | sort -V | tail -1)
+
+        if [[ "$LATEST" == "$BASE_VERSION" && "$PR_VERSION" != "$BASE_VERSION" ]]; then
+          echo "❌ VERSION (v${PR_VERSION}) is behind base branch '${BASE_REF}' (v${BASE_VERSION})."
+          echo "   Please rebase your branch onto ${BASE_REF} and update VERSION to v${BASE_VERSION} or higher."
+          exit 1
+        fi
+
+        echo "✅ VERSION (v${PR_VERSION}) is not behind base branch (v${BASE_VERSION})."
+      shell: bash

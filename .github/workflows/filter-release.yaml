@@ -17,6 +17,28 @@ on:
         required: false
         type: string
         default: plainsightai
+      source-paths:
+        description: |
+          Optional newline-separated glob patterns considered substantive
+          changes for the release-log check. When set, check-release-log is
+          a no-op if the PR touches none of these paths. When unset, every
+          PR to main must update RELEASE.md (existing behavior).
+
+          Do NOT include RELEASE.md itself — the downstream step already
+          checks that, and including it here creates a tautology where every
+          RELEASE.md edit satisfies the gate regardless of substantive change.
+        required: false
+        type: string
+        default: ''
+      ignore-paths:
+        description: |
+          Optional newline-separated glob patterns of paths that do NOT count
+          as substantive for the release-log check. When set, check-release-log
+          is a no-op if the PR changes ONLY files matching these globs. Can
+          be combined with source-paths; both filters apply.
+        required: false
+        type: string
+        default: ''
     secrets:
       PYPI_API_TOKEN:
         required: true
@@ -39,55 +61,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify RELEASE.md changed in PR
-        id: changed_files
-        uses: tj-actions/changed-files@v47
+      # Delegate to the sibling composite so the source-paths/ignore-paths
+      # gate logic lives in one place for public consumers. The composite
+      # lives in this same (public) repo, so fork PRs to downstream public
+      # filter repos can reach it — no visibility regression.
+      #
+      # Pinned to the current branch during live-test; will re-pin to @main
+      # in a follow-up once this PR merges.
+      - name: Check release log
+        uses: PlainsightAI/gh-actions-public/check-release-log@refactor/ti-377-use-shared-check-release-log
         with:
-          files: RELEASE.md
-
-      - name: Validate RELEASE.md on PRs to main
-        if: steps.changed_files.outputs.any_changed != 'true'
-        shell: bash
-        run: |
-          echo "RELEASE.md must be updated in this PR."
-          exit 1
-
-      - name: Parse changelog entry
-        id: changelog
-        uses: PlainsightAI/changelog-parser-action@main
-        with:
-          path: RELEASE.md
-
-      - name: Validate VERSION consistency
-        shell: bash
-        env:
-          CHANGELOG_VERSION: ${{ steps.changelog.outputs.version }}
-        run: |
-          if [[ ! -f VERSION ]]; then
-            echo "VERSION file is required."
-            exit 1
-          fi
-          version_file="$(tr -d '[:space:]' < VERSION)"
-          if [[ "$version_file" != "$CHANGELOG_VERSION" ]]; then
-            echo "VERSION mismatch! VERSION file: $version_file, RELEASE.md: $CHANGELOG_VERSION"
-            exit 1
-          fi
-
-      - name: Validate VERSION not behind base branch
-        shell: bash
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch origin "$BASE_REF" --depth=1
-          if git show "origin/$BASE_REF:VERSION" >/dev/null 2>&1; then
-            base_version="$(git show "origin/$BASE_REF:VERSION" | tr -d '[:space:]')"
-            current_version="$(tr -d '[:space:]' < VERSION)"
-            latest="$(printf '%s\n%s\n' "$base_version" "$current_version" | sort -V | tail -n1)"
-            if [[ "$latest" != "$current_version" ]]; then
-              echo "VERSION is behind base branch. Base: $base_version Current: $current_version"
-              exit 1
-            fi
-          fi
+          source-paths: ${{ inputs.source-paths }}
+          ignore-paths: ${{ inputs.ignore-paths }}
 
   run-tests:
     runs-on: ubuntu-latest
