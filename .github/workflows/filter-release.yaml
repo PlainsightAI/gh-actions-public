@@ -51,6 +51,10 @@ permissions:
   contents: write
   pull-requests: read
 
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check-release-log:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
