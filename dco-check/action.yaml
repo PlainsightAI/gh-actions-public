@@ -1,0 +1,85 @@
+name: "DCO Check"
+description: >
+  Verifies that every commit in the pull request carries a
+  `Signed-off-by: Name <email>` trailer, per the Developer Certificate of
+  Origin (https://developercertificate.org/). Fails the job listing offending
+  commits with remediation instructions.
+
+inputs: {}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify DCO sign-off on all PR commits
+      # BASE_REF is provided via env: to avoid shell injection — branch names
+      # can contain shell metacharacters that would be executed as code if
+      # interpolated into a run: script.
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${BASE_REF:-}" ]]; then
+          echo "ERROR: BASE_REF is empty; this action requires a pull_request event."
+          exit 1
+        fi
+
+        # Shallow-fetch the base ref so we can compute origin/BASE_REF..HEAD.
+        # 50 is plenty to find the merge base for normal PRs without being heavy.
+        if ! git fetch origin "$BASE_REF" --depth=50; then
+          echo "ERROR: failed to fetch origin/$BASE_REF."
+          exit 1
+        fi
+
+        # Collect the commit SHAs on the PR branch not on the base.
+        COMMITS=$(git log "origin/$BASE_REF..HEAD" --format=%H)
+
+        if [[ -z "$COMMITS" ]]; then
+          echo "No commits between origin/$BASE_REF and HEAD — nothing to check."
+          exit 0
+        fi
+
+        TOTAL=0
+        OFFENDERS=()
+        OFFENDER_SUBJECTS=()
+
+        while IFS= read -r sha; do
+          [[ -z "$sha" ]] && continue
+          TOTAL=$((TOTAL + 1))
+
+          # Full commit message (subject + body + trailers).
+          MSG=$(git log -1 --format=%B "$sha")
+
+          # Match a line like `Signed-off-by: Foo Bar <foo@bar.tld>`.
+          # -E for ERE; anchored per-line via grep's default line semantics.
+          if ! printf '%s\n' "$MSG" | grep -Eq '^Signed-off-by: .+ <.+@.+>$'; then
+            SUBJECT=$(git log -1 --format=%s "$sha")
+            OFFENDERS+=("$sha")
+            OFFENDER_SUBJECTS+=("$SUBJECT")
+          fi
+        done <<< "$COMMITS"
+
+        if [[ "${#OFFENDERS[@]}" -eq 0 ]]; then
+          echo "✅ All $TOTAL commits signed off."
+          exit 0
+        fi
+
+        echo "❌ The following commits are missing a Signed-off-by trailer:"
+        for i in "${!OFFENDERS[@]}"; do
+          SHORT=$(printf '%s' "${OFFENDERS[$i]}" | cut -c1-8)
+          # Print subject via explicit %s to avoid any format-string interpretation.
+          printf '  %s  ' "$SHORT"
+          printf '%s\n' "${OFFENDER_SUBJECTS[$i]}"
+        done
+
+        N="${#OFFENDERS[@]}"
+        echo ""
+        echo "To fix, either amend the offending commits:"
+        echo "  git commit --amend --signoff"
+        echo "Or re-sign a range:"
+        echo "  git rebase HEAD~$N --signoff"
+        echo "Then force-push to your PR branch."
+        echo ""
+        echo "See https://developercertificate.org/ for the DCO text you are certifying."
+        exit 1
