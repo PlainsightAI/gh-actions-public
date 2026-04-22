@@ -74,7 +74,12 @@ runs:
     - name: Parse Changelog Entry
       if: steps.should_run.outputs.run == 'true'
       id: changelog
-      uses: PlainsightAI/gh-actions/changelog-parser@main
+      # PUBLIC standalone repo, not PlainsightAI/gh-actions/changelog-parser —
+      # a fork PR on a restricted GITHUB_TOKEN can't read internal repos, which
+      # would 404 here and defeat the point of vendoring this composite into
+      # gh-actions-public. The public action is API-compatible; filter-release.yaml
+      # was already using it before this refactor extracted the gate.
+      uses: PlainsightAI/changelog-parser-action@main
       with:
         path: RELEASE.md
 
