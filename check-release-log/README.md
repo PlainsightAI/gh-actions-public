@@ -92,21 +92,6 @@ If the PR touches none of the listed globs (or, for `ignore-paths`, ONLY files m
 
 ---
 
-## ⚠️ Behavior differences vs. prior inline gate
-
-Repositories migrating from the inlined gate that previously lived in `gh-actions-public/filter-release.yaml` should note the following intentional softenings — the composite is deliberately more permissive on missing/unusual version metadata than the inline predecessor:
-
-- **`VERSION` file is optional.** The inline gate hard-failed with `VERSION file is required.` when the file was absent. The composite skips version checks gracefully when `VERSION` is missing on either branch.
-- **Three new `exit 0` skip paths in the "not behind base" check:**
-  - Base branch has no `VERSION` (first-time adoption of the gate).
-  - PR branch has no `VERSION` (non-versioned PR).
-  - Either side carries a pre-release / build-metadata suffix (`-rc1`, `+build.5`, etc.) — `sort -V` doesn't order pre-release identifiers correctly per semver, so the composite skips rather than false-positive.
-- **Plain `X.Y.Z` comparison only.** Pre-release / suffix versions no longer participate in the base-comparison. Use `source-paths` / `ignore-paths` to gate pre-release PRs explicitly if tighter enforcement is needed.
-
-Consumers that relied on the inline gate to block unversioned releases should add an out-of-band check (or keep `VERSION` present) — this composite will not fail them.
-
----
-
 ## 🔌 Integration
 
 This action is typically used as part of your PR CI checks for repositories that publish versioned packages, Docker images, or documentation.
