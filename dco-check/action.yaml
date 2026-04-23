@@ -25,15 +25,25 @@ runs:
           exit 1
         fi
 
-        # Shallow-fetch the base ref so we can compute origin/BASE_REF..HEAD.
-        # 50 is plenty to find the merge base for normal PRs without being heavy.
-        if ! git fetch origin "$BASE_REF" --depth=50; then
+        # Fetch the base ref so we can compute origin/BASE_REF..HEAD.
+        # No --depth: shallow-fetching only N commits of the base doesn't
+        # bound the A..B range — if the PR branch diverged more than N
+        # commits ago, the merge-base won't be present and `git log
+        # origin/BASE_REF..HEAD` quietly returns garbage. The README
+        # requires the caller to checkout with fetch-depth: 0, so the PR
+        # side already has full history; fetching full base history here
+        # keeps the two sides consistent.
+        if ! git fetch origin "$BASE_REF"; then
           echo "ERROR: failed to fetch origin/$BASE_REF."
           exit 1
         fi
 
         # Collect the commit SHAs on the PR branch not on the base.
-        COMMITS=$(git log "origin/$BASE_REF..HEAD" --format=%H)
+        # --no-merges skips merge commits — they don't carry a
+        # Signed-off-by trailer (git doesn't auto-sign merges) and the
+        # remediation snippets below don't apply to them. This matches
+        # GitHub's own DCO bot behavior.
+        COMMITS=$(git log "origin/$BASE_REF..HEAD" --no-merges --format=%H)
 
         if [[ -z "$COMMITS" ]]; then
           echo "No commits between origin/$BASE_REF and HEAD — nothing to check."
