@@ -1,8 +1,11 @@
 # External Review Freshness
 
-Dismisses APPROVED pull request reviews whenever an **untrusted** contributor
-pushes new commits, while preserving approvals when the pusher is a trusted
-repository collaborator.
+Dismisses APPROVED pull request reviews whenever a PR **authored by an
+untrusted contributor** receives new commits, while preserving approvals on
+PRs authored by trusted repository collaborators. Trust is keyed on the PR
+author (not the pusher of the synchronize event) so that "Allow edits by
+maintainers" fixups on a fork PR still get re-reviewed — the PR itself is
+still an untrusted contribution in flight.
 
 ## Usage
 

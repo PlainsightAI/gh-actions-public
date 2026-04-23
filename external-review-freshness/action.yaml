@@ -44,6 +44,16 @@ runs:
       run: |
         set -euo pipefail
 
+        # Guard against misconfiguration: fork pull_request tokens cannot
+        # dismiss reviews, and opened/reopened dismissing pre-existing
+        # approvals is not the intended behavior. Fail loudly instead of
+        # surfacing a mysterious 403 at the dismissal PUT.
+        if [[ "${GITHUB_EVENT_NAME:-}" != "pull_request_target" ]]; then
+          echo "ERROR: this action must be invoked from a pull_request_target workflow (got '${GITHUB_EVENT_NAME:-<unset>}')."
+          echo "       See the README for the required trigger configuration."
+          exit 1
+        fi
+
         if [[ -z "${PR_AUTHOR:-}" ]]; then
           echo "ERROR: PR author login is empty; is this running on pull_request_target?"
           exit 1
@@ -51,38 +61,48 @@ runs:
 
         echo "Checking repo collaborator permission for '$PR_AUTHOR' on '$OWNER/$REPO'..."
 
-        # Query the permission endpoint. 404 = not a collaborator at all; any
-        # other non-zero HTTP status is a real API failure and should fail the
-        # job. We capture the body and status separately so we can distinguish.
-        HTTP_STATUS=0
-        PERM_BODY=""
-        set +e
-        PERM_BODY=$(gh api \
+        # Query the permission endpoint and parse the HTTP status from the
+        # response headers. 404 = not a collaborator at all; any other
+        # non-2xx is a real API failure and should fail the job. Using
+        # `--include` means we don't depend on gh CLI's stderr format, which
+        # is not part of its stable contract.
+        PERM_RAW=$(gh api --include \
           -H "Accept: application/vnd.github+json" \
-          "repos/$OWNER/$REPO/collaborators/$PR_AUTHOR/permission" 2>/tmp/perm_err)
-        HTTP_STATUS=$?
-        set -e
+          "repos/$OWNER/$REPO/collaborators/$PR_AUTHOR/permission" 2>/dev/null || true)
+
+        # First HTTP status line. Tolerates HTTP/1.1 and HTTP/2[.0] forms.
+        PERM_STATUS=$(printf '%s\n' "$PERM_RAW" \
+          | grep -m1 -Eo '^HTTP/[0-9.]+ [0-9]{3}' \
+          | awk '{print $2}' || true)
+
+        # Body is everything after the first blank line separating headers.
+        PERM_BODY=$(printf '%s\n' "$PERM_RAW" | awk 'BEGIN{b=0} /^\r?$/{b=1; next} b{print}')
 
         ROLE=""
-        if [[ "$HTTP_STATUS" -eq 0 ]]; then
-          ROLE=$(printf '%s' "$PERM_BODY" | jq -r '.role_name // empty')
-          if [[ -z "$ROLE" ]]; then
-            echo "ERROR: permission response missing .role_name; raw body follows:"
-            printf '%s\n' "$PERM_BODY"
-            exit 1
-          fi
-        else
-          # gh api exits non-zero on any HTTP error. Treat 404 as non-collaborator,
-          # fail on everything else.
-          if grep -q "HTTP 404" /tmp/perm_err 2>/dev/null; then
+        case "${PERM_STATUS:-}" in
+          200)
+            ROLE=$(printf '%s' "$PERM_BODY" | jq -r '.role_name // empty')
+            if [[ -z "$ROLE" ]]; then
+              echo "ERROR: permission response missing .role_name; raw body follows:"
+              printf '%s\n' "$PERM_BODY"
+              exit 1
+            fi
+            ;;
+          404)
             echo "User '$PR_AUTHOR' is not a collaborator on $OWNER/$REPO (HTTP 404)."
             ROLE="none"
-          else
-            echo "ERROR: unexpected failure calling collaborators permission endpoint:"
-            cat /tmp/perm_err || true
+            ;;
+          "")
+            echo "ERROR: could not parse HTTP status from collaborators permission response:"
+            printf '%s\n' "$PERM_RAW"
             exit 1
-          fi
-        fi
+            ;;
+          *)
+            echo "ERROR: unexpected HTTP $PERM_STATUS from collaborators permission endpoint:"
+            printf '%s\n' "$PERM_RAW"
+            exit 1
+            ;;
+        esac
 
         echo "Resolved role_name: '$ROLE'"
 
@@ -100,10 +120,14 @@ runs:
             ;;
         esac
 
-        # List reviews on the PR and filter to APPROVED.
-        REVIEWS_JSON=$(gh api \
+        # List reviews on the PR and filter to APPROVED. --paginate walks
+        # every page so approvals beyond the default 30-per-page window are
+        # also dismissed. With --paginate, gh emits a concatenated stream
+        # of arrays, so we merge them with `jq -s 'add'` before filtering.
+        REVIEWS_JSON=$(gh api --paginate \
           -H "Accept: application/vnd.github+json" \
-          "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews")
+          "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews" \
+          | jq -s 'add // []')
 
         # Emit "<id> <login>" per approved review.
         APPROVED=$(printf '%s' "$REVIEWS_JSON" \
