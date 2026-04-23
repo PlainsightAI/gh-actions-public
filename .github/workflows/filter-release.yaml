@@ -51,6 +51,8 @@ permissions:
   contents: write
   pull-requests: read
 
+# Queue concurrent runs instead of cancelling — a partial release (PyPI
+# wheel published, Docker image missing) is worse than waiting.
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
