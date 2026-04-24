@@ -1,0 +1,163 @@
+name: "External Review Freshness"
+description: >
+  Dismisses APPROVED pull request reviews when an untrusted contributor pushes
+  new commits. Trust is determined by the PR author's repository collaborator
+  permission level (admin / maintain / write → trusted; everyone else →
+  dismiss). Meant to be invoked from a pull_request_target workflow on the
+  synchronize event so it has base-repo permissions for fork PRs.
+
+inputs:
+  github-token:
+    description: >
+      Token with `pull-requests: write` (to dismiss reviews) and repo
+      `metadata: read` (to look up collaborator permissions). The default
+      `secrets.GITHUB_TOKEN` is sufficient for public repos and for org
+      repos where the invoking workflow grants `pull-requests: write`.
+    required: true
+  dismissal-message:
+    description: "Message attached to each dismissed review."
+    required: false
+    default: "Approving review dismissed because an untrusted contributor pushed new commits. A collaborator must re-review."
+  dry-run:
+    description: >
+      If "true", log what would be dismissed but do not actually call the
+      dismissal endpoint. Useful for first-rollout validation. String-typed:
+      composite-action input booleans are coerced to strings.
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Dismiss stale approvals on untrusted-contributor push
+      # All untrusted values are passed via env: to avoid shell injection —
+      # never interpolate ${{ github.* }} or inputs directly into run: scripts.
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OWNER: ${{ github.event.repository.owner.login }}
+        REPO: ${{ github.event.repository.name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        DISMISSAL_MESSAGE: ${{ inputs.dismissal-message }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Guard against misconfiguration: fork pull_request tokens cannot
+        # dismiss reviews, and opened/reopened dismissing pre-existing
+        # approvals is not the intended behavior. Fail loudly instead of
+        # surfacing a mysterious 403 at the dismissal PUT.
+        if [[ "${GITHUB_EVENT_NAME:-}" != "pull_request_target" ]]; then
+          echo "ERROR: this action must be invoked from a pull_request_target workflow (got '${GITHUB_EVENT_NAME:-<unset>}')."
+          echo "       See the README for the required trigger configuration."
+          exit 1
+        fi
+
+        if [[ -z "${PR_AUTHOR:-}" ]]; then
+          echo "ERROR: PR author login is empty; is this running on pull_request_target?"
+          exit 1
+        fi
+
+        echo "Checking repo collaborator permission for '$PR_AUTHOR' on '$OWNER/$REPO'..."
+
+        # Query the permission endpoint and parse the HTTP status from the
+        # response headers. 404 = not a collaborator at all; any other
+        # non-2xx is a real API failure and should fail the job. Using
+        # `--include` means we don't depend on gh CLI's stderr format, which
+        # is not part of its stable contract.
+        PERM_RAW=$(gh api --include \
+          -H "Accept: application/vnd.github+json" \
+          "repos/$OWNER/$REPO/collaborators/$PR_AUTHOR/permission" 2>/dev/null || true)
+
+        # First HTTP status line. Tolerates HTTP/1.1 and HTTP/2[.0] forms.
+        PERM_STATUS=$(printf '%s\n' "$PERM_RAW" \
+          | grep -m1 -Eo '^HTTP/[0-9.]+ [0-9]{3}' \
+          | awk '{print $2}' || true)
+
+        # Body is everything after the first blank line separating headers.
+        PERM_BODY=$(printf '%s\n' "$PERM_RAW" | awk 'BEGIN{b=0} /^\r?$/{b=1; next} b{print}')
+
+        ROLE=""
+        case "${PERM_STATUS:-}" in
+          200)
+            ROLE=$(printf '%s' "$PERM_BODY" | jq -r '.role_name // empty')
+            if [[ -z "$ROLE" ]]; then
+              echo "ERROR: permission response missing .role_name; raw body follows:"
+              printf '%s\n' "$PERM_BODY"
+              exit 1
+            fi
+            ;;
+          404)
+            echo "User '$PR_AUTHOR' is not a collaborator on $OWNER/$REPO (HTTP 404)."
+            ROLE="none"
+            ;;
+          "")
+            echo "ERROR: could not parse HTTP status from collaborators permission response:"
+            printf '%s\n' "$PERM_RAW"
+            exit 1
+            ;;
+          *)
+            echo "ERROR: unexpected HTTP $PERM_STATUS from collaborators permission endpoint:"
+            printf '%s\n' "$PERM_RAW"
+            exit 1
+            ;;
+        esac
+
+        echo "Resolved role_name: '$ROLE'"
+
+        case "$ROLE" in
+          admin|maintain|write)
+            echo "PR author $PR_AUTHOR has '$ROLE' permission — skipping dismissal."
+            exit 0
+            ;;
+          triage|read|none)
+            echo "PR author $PR_AUTHOR has '$ROLE' permission — treating as untrusted; enumerating approved reviews."
+            ;;
+          *)
+            echo "ERROR: unknown role_name '$ROLE' from GitHub API."
+            exit 1
+            ;;
+        esac
+
+        # List reviews on the PR and filter to APPROVED. --paginate walks
+        # every page so approvals beyond the default 30-per-page window are
+        # also dismissed. With --paginate, gh emits a concatenated stream
+        # of arrays, so we merge them with `jq -s 'add'` before filtering.
+        REVIEWS_JSON=$(gh api --paginate \
+          -H "Accept: application/vnd.github+json" \
+          "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews" \
+          | jq -s 'add // []')
+
+        # Emit "<id> <login>" per approved review.
+        APPROVED=$(printf '%s' "$REVIEWS_JSON" \
+          | jq -r '.[] | select(.state == "APPROVED") | "\(.id) \(.user.login)"')
+
+        if [[ -z "$APPROVED" ]]; then
+          echo "No APPROVED reviews on PR #$PR_NUMBER — nothing to dismiss."
+          exit 0
+        fi
+
+        DISMISSED_COUNT=0
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          RID=$(printf '%s' "$line" | awk '{print $1}')
+          REVIEWER=$(printf '%s' "$line" | awk '{print $2}')
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] Would dismiss review id=$RID by reviewer=$REVIEWER on PR #$PR_NUMBER"
+          else
+            echo "Dismissing review id=$RID by reviewer=$REVIEWER on PR #$PR_NUMBER"
+            gh api -X PUT \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews/$RID/dismissals" \
+              -f "message=$DISMISSAL_MESSAGE" >/dev/null
+          fi
+          DISMISSED_COUNT=$((DISMISSED_COUNT + 1))
+        done <<< "$APPROVED"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "[DRY RUN] Would have dismissed $DISMISSED_COUNT approved review(s)."
+        else
+          echo "Dismissed $DISMISSED_COUNT approved review(s)."
+        fi
