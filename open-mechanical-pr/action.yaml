@@ -1,0 +1,200 @@
+name: "Open Mechanical PR"
+description: |
+  Opens a bot-authored pull request from a working tree of staged changes.
+  Supersedes any open PRs whose head branch shares the configured prefix,
+  commits + pushes a fresh branch named ${branch_prefix}${short_sha}, opens
+  the PR, and (by default) enables native auto-merge. Idempotent: a clean
+  working tree exits successfully without doing anything.
+
+  Lifted from the supersede + push + create logic of client-portal's
+  update-api-client.yaml so cascade workflows (openfilter, gh-actions, …)
+  share one implementation.
+
+inputs:
+  repo:
+    description: "Target consumer repo in owner/name form (e.g. PlainsightAI/filter-sam3-detector)."
+    required: true
+  branch_prefix:
+    description: |
+      Branch prefix for the bot PR head (e.g. bump-openfilter-, bump-gh-actions-).
+      Used both for the new branch name (${branch_prefix}${short_sha}) and to
+      identify open predecessors to supersede. Pick a prefix unique to the
+      cascade so unrelated bot PRs are not closed.
+    required: true
+  commit_message:
+    description: "Commit message for the staged changes."
+    required: true
+  pr_title:
+    description: "Pull request title."
+    required: true
+  pr_body:
+    description: "Pull request body (markdown)."
+    required: true
+  gh_token:
+    description: "GitHub token (plainsight-bot PAT) used for git push, PR creation, and auto-merge enablement."
+    required: true
+  auto_merge:
+    description: "Set to 'false' to skip 'gh pr merge --auto'. Defaults to 'true'."
+    required: false
+    default: 'true'
+  merge_method:
+    description: "Merge method passed to 'gh pr merge --auto': squash | merge | rebase."
+    required: false
+    default: 'squash'
+  working_directory:
+    description: "Path to the cloned consumer repo on the runner. Defaults to the current directory."
+    required: false
+    default: '.'
+
+outputs:
+  pr_url:
+    description: "URL of the created pull request. Empty if the working tree was clean (no-op)."
+    value: ${{ steps.create_pr.outputs.pr_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure git identity and check for changes
+      id: precheck
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        git config user.name "plainsight-bot"
+        git config user.email "cloudinfra@plainsight.ai"
+
+        # Idempotency guard: a clean working tree means upstream's bump
+        # strategy already converged (e.g. the consumer's pin already
+        # satisfies the new version, or this run is a retry of a no-op).
+        # Exit success and let downstream steps short-circuit on has_changes.
+        if git diff --quiet && git diff --cached --quiet; then
+          echo "Working tree clean; nothing to commit."
+          echo "has_changes=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Supersede stale predecessor PRs
+      if: steps.precheck.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+      run: |
+        # Only one open cascade PR per prefix at a time. Filtering via jq
+        # because gh pr list's --search head: qualifier is exact-match, not
+        # prefix. --delete-branch keeps the remote tidy; superseded branches
+        # have no other purpose. Pass the prefix via env (BRANCH_PREFIX) so
+        # the jq query reads it from $ENV — never inline ${{ inputs.* }}
+        # into a shell script (branch names can carry shell metacharacters).
+        mapfile -t stale < <(
+          gh pr list \
+            --repo "$REPO" \
+            --state open \
+            --base main \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith(env.BRANCH_PREFIX)) | "\(.number)\t\(.headRefName)"'
+        )
+
+        if [ "${#stale[@]}" -eq 0 ]; then
+          echo "No stale ${BRANCH_PREFIX}* PRs to supersede."
+          exit 0
+        fi
+
+        for entry in "${stale[@]}"; do
+          [ -z "$entry" ] && continue
+          num="${entry%%$'\t'*}"
+          branch="${entry#*$'\t'}"
+          echo "Closing #${num} (${branch}) — superseded by a fresh ${BRANCH_PREFIX} run."
+          # Best-effort: a concurrent run may have already closed the PR;
+          # don't let a 422 here abort the cascade.
+          gh pr close "$num" \
+            --repo "$REPO" \
+            --delete-branch \
+            --comment "Superseded by a fresh ${BRANCH_PREFIX} run." \
+            || echo "WARN: failed to close #${num}; continuing."
+        done
+
+    - name: Commit and push branch
+      id: push
+      if: steps.precheck.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+        COMMIT_MESSAGE: ${{ inputs.commit_message }}
+      run: |
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        BRANCH_NAME="${BRANCH_PREFIX}${SHORT_SHA}"
+
+        git checkout -b "$BRANCH_NAME"
+        git add -A
+        git commit -m "$COMMIT_MESSAGE"
+
+        # Authenticate the push via gh's token helper rather than rewriting
+        # the remote URL — keeps the token out of `git remote -v` and the
+        # reflog. gh injects the credential into the libcurl-style helper
+        # chain that git already consults.
+        gh auth setup-git
+        git push origin "$BRANCH_NAME"
+
+        echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+    - name: Create pull request
+      id: create_pr
+      if: steps.precheck.outputs.has_changes == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        BRANCH_NAME: ${{ steps.push.outputs.branch_name }}
+        PR_TITLE: ${{ inputs.pr_title }}
+        PR_BODY: ${{ inputs.pr_body }}
+      run: |
+        PR_URL=$(gh pr create \
+          --repo "$REPO" \
+          --base main \
+          --head "$BRANCH_NAME" \
+          --title "$PR_TITLE" \
+          --body "$PR_BODY")
+
+        echo "Opened: $PR_URL"
+        echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+    - name: Enable native auto-merge
+      if: steps.precheck.outputs.has_changes == 'true' && inputs.auto_merge == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+        MERGE_METHOD: ${{ inputs.merge_method }}
+      run: |
+        # Native auto-merge: GitHub merges as soon as required checks +
+        # reviews pass. Branch protection on the consumer's main is the
+        # source of truth for "what does merge readiness mean here":
+        #   - required checks (tests + dry-run-publish) → merges on green
+        #   - required reviews                          → waits for review
+        #   - no protection at all                      → gh errors
+        #
+        # The unprotected case is a soft warning, not a failure: the PR
+        # still exists, a human can merge it manually. Failing the cascade
+        # over a missing branch protection rule would block bumps from
+        # landing in repos that haven't completed the protection sweep yet.
+        case "$MERGE_METHOD" in
+          squash|merge|rebase) ;;
+          *)
+            echo "ERROR: invalid merge_method '$MERGE_METHOD' (expected squash|merge|rebase)."
+            exit 1
+            ;;
+        esac
+
+        if ! gh pr merge --auto "--$MERGE_METHOD" "$PR_URL"; then
+          echo "WARN: 'gh pr merge --auto --$MERGE_METHOD' failed for $PR_URL."
+          echo "WARN: Likely cause: target branch has no protection rule, so auto-merge"
+          echo "WARN: is not enabled for the repo. PR remains open for manual merge."
+        fi
