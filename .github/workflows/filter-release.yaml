@@ -39,6 +39,37 @@ on:
         required: false
         type: string
         default: ''
+      forward_secrets_as_env:
+        description: |
+          Comma-separated names of inherited secrets to forward as env vars
+          into the publish-docker job. Requires `secrets: inherit` on the
+          caller. Pair with `build_secrets` to expose them to BuildKit at
+          build time. Mirrors the same input on filter-release-premium.yaml.
+        required: false
+        type: string
+        default: ''
+      build_secrets:
+        description: |
+          Newline-separated lines passed verbatim to docker/build-push-action's
+          `secrets:` input. Each line is a BuildKit secret spec
+          (`id=<id>,env=<ENV_VAR>` or `id=<id>,src=<path>`).
+
+          For env-backed secrets, the env var MUST exist in the publish-docker
+          job — typically via `forward_secrets_as_env` + `secrets: inherit` on
+          the caller. Setting `build_secrets: id=foo,env=FOO` without
+          arranging for `FOO` to be present at build time will fail inside
+          BuildKit with an opaque "secret not found" error; the workflow
+          itself cannot detect this misconfiguration.
+
+          Example for a Dockerfile that uses
+          `RUN --mount=type=secret,id=hf_token`:
+
+            forward_secrets_as_env: HF_TOKEN
+            build_secrets: |
+              id=hf_token,env=HF_TOKEN
+        required: false
+        type: string
+        default: ''
     secrets:
       PYPI_API_TOKEN:
         required: true
@@ -283,6 +314,30 @@ jobs:
           username: ${{ inputs.dockerhub_username }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Forward caller-listed inherited secrets into $GITHUB_ENV so subsequent
+      # steps (notably docker/build-push-action with build_secrets:
+      # id=<id>,env=<NAME>) can see them. GitHub Actions doesn't allow callers
+      # to inject env into reusable-workflow steps, so this loop is the
+      # workaround: caller passes names via forward_secrets_as_env +
+      # secrets: inherit, we resolve each via toJson(secrets) and write to
+      # $GITHUB_ENV with masking. Mirrors the same step in
+      # filter-release-premium.yaml.
+      - name: Forward inherited secrets to env
+        if: inputs.forward_secrets_as_env != ''
+        env:
+          ALL_SECRETS: ${{ toJson(secrets) }}
+          NAMES: ${{ inputs.forward_secrets_as_env }}
+        run: |
+          IFS=',' read -ra names <<< "$NAMES"
+          for name in "${names[@]}"; do
+            name="${name//[[:space:]]/}"; [ -z "$name" ] && continue
+            value=$(printf '%s' "$ALL_SECRETS" | jq -r --arg k "$name" '.[$k] // ""')
+            [ -z "$value" ] && { echo "::warning::secret '$name' listed in forward_secrets_as_env but not found in inherited secrets context"; continue; }
+            echo "::add-mask::$value"
+            delim="ghsecret_$(openssl rand -hex 8)"
+            { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+          done
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -303,6 +358,7 @@ jobs:
             ${{ inputs.docker_image }}:${{ needs.prepare-pypi-publish.outputs.package_version }}
             ${{ inputs.docker_image }}:latest
           labels: ${{ steps.meta.outputs.labels }}
+          secrets: ${{ inputs.build_secrets }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
