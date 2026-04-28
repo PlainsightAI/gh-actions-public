@@ -89,23 +89,17 @@ on:
         type: string
         default: 'linux/amd64,linux/arm64'
     secrets:
+      # Both `*_TOKEN` and `PLAINSIGHT_*` / `DOCKERHUB_ACCESS_TOKEN` names
+      # are accepted at runtime via fallback expressions in publish-to-pypi
+      # and publish-docker. `required: false` lets callers pass either
+      # name (or use `secrets: inherit` to receive both via the org-level
+      # canonical names). One of the two MUST resolve to a non-empty value
+      # at runtime — twine/docker login will fail noisily otherwise.
       PYPI_API_TOKEN:
-        required: true
-      DOCKERHUB_TOKEN:
-        required: true
-      GH_BOT_USER_PAT:
         required: false
-      # Build-time secret for filters with HuggingFace gated-model
-      # dependencies. Caller passes via explicit mapping (e.g.
-      # `HF_TOKEN: ${{ secrets.HF_TOKEN }}`) and references the value at
-      # build time via `forward_secrets_as_env: HF_TOKEN` +
-      # `build_secrets: id=hf_token,env=HF_TOKEN`. Declared here so it
-      # resolves through `secrets.HF_TOKEN` / `toJson(secrets)` without
-      # forcing callers onto `secrets: inherit`, which would conflict
-      # with the explicit-mapping pattern every other public filter uses
-      # (PYPI_API_TOKEN / DOCKERHUB_TOKEN are remapped from differently-
-      # named org secrets, and inherit is all-or-nothing).
-      HF_TOKEN:
+      DOCKERHUB_TOKEN:
+        required: false
+      GH_BOT_USER_PAT:
         required: false
 
 permissions:
@@ -315,7 +309,7 @@ jobs:
       - name: Publish wheel to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN || secrets.PLAINSIGHT_PYPI_TOKEN }}
         run: python -m twine upload dist/*.whl
 
   publish-docker:
@@ -339,7 +333,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ inputs.dockerhub_username }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
 
       # Forward caller-listed inherited secrets into $GITHUB_ENV so subsequent
       # steps (notably docker/build-push-action with build_secrets:
