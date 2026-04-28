@@ -120,11 +120,8 @@ jobs:
       # gate logic lives in one place for public consumers. The composite
       # lives in this same (public) repo, so fork PRs to downstream public
       # filter repos can reach it — no visibility regression.
-      #
-      # Pinned to the current branch during live-test; will re-pin to @main
-      # in a follow-up once this PR merges.
       - name: Check release log
-        uses: PlainsightAI/gh-actions-public/check-release-log@refactor/ti-377-use-shared-check-release-log
+        uses: PlainsightAI/gh-actions-public/check-release-log@main
         with:
           source-paths: ${{ inputs.source-paths }}
           ignore-paths: ${{ inputs.ignore-paths }}
