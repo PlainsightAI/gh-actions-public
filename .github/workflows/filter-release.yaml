@@ -70,11 +70,35 @@ on:
         required: false
         type: string
         default: ''
+      platforms:
+        description: |
+          Comma-separated list of target platforms passed to
+          docker/build-push-action's `platforms:` input. Defaults to
+          `linux/amd64,linux/arm64` so existing callers see no behavior
+          change.
+
+          Override for filters whose base image isn't multi-arch (e.g.
+          CUDA-based filters using `pytorch/pytorch:*-cuda*`, which ships
+          amd64-only) or for callers that need to opt out of arm64
+          emulation builds for cost/time reasons.
+
+          Example for a CUDA-based filter:
+
+            platforms: linux/amd64
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
     secrets:
+      # Both `*_TOKEN` and `PLAINSIGHT_*` / `DOCKERHUB_ACCESS_TOKEN` names
+      # are accepted at runtime via fallback expressions in publish-to-pypi
+      # and publish-docker. `required: false` lets callers pass either
+      # name (or use `secrets: inherit` to receive both via the org-level
+      # canonical names). One of the two MUST resolve to a non-empty value
+      # at runtime — twine/docker login will fail noisily otherwise.
       PYPI_API_TOKEN:
-        required: true
+        required: false
       DOCKERHUB_TOKEN:
-        required: true
+        required: false
       GH_BOT_USER_PAT:
         required: false
 
@@ -102,11 +126,8 @@ jobs:
       # gate logic lives in one place for public consumers. The composite
       # lives in this same (public) repo, so fork PRs to downstream public
       # filter repos can reach it — no visibility regression.
-      #
-      # Pinned to the current branch during live-test; will re-pin to @main
-      # in a follow-up once this PR merges.
       - name: Check release log
-        uses: PlainsightAI/gh-actions-public/check-release-log@refactor/ti-377-use-shared-check-release-log
+        uses: PlainsightAI/gh-actions-public/check-release-log@main
         with:
           source-paths: ${{ inputs.source-paths }}
           ignore-paths: ${{ inputs.ignore-paths }}
@@ -288,7 +309,7 @@ jobs:
       - name: Publish wheel to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN || secrets.PLAINSIGHT_PYPI_TOKEN }}
         run: python -m twine upload dist/*.whl
 
   publish-docker:
@@ -312,7 +333,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ inputs.dockerhub_username }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
 
       # Forward caller-listed inherited secrets into $GITHUB_ENV so subsequent
       # steps (notably docker/build-push-action with build_secrets:
@@ -352,7 +373,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.platforms }}
           push: true
           tags: |
             ${{ inputs.docker_image }}:${{ needs.prepare-pypi-publish.outputs.package_version }}
