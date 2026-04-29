@@ -89,15 +89,18 @@ on:
         type: string
         default: 'linux/amd64,linux/arm64'
     secrets:
-      # Both `*_TOKEN` and `PLAINSIGHT_*` / `DOCKERHUB_ACCESS_TOKEN` names
-      # are accepted at runtime via fallback expressions in publish-to-pypi
-      # and publish-docker. `required: false` lets callers pass either
-      # name (or use `secrets: inherit` to receive both via the org-level
-      # canonical names). One of the two MUST resolve to a non-empty value
-      # at runtime — twine/docker login will fail noisily otherwise.
+      # Callers can pass secrets explicitly or use `secrets: inherit`.
+      # With inherit, only declared names are visible in the secrets context,
+      # so we declare both the workflow names AND the org-level canonical
+      # names. The publish steps use fallback expressions (A || B) so either
+      # name resolves correctly.
       PYPI_API_TOKEN:
         required: false
+      PLAINSIGHT_PYPI_TOKEN:
+        required: false
       DOCKERHUB_TOKEN:
+        required: false
+      DOCKERHUB_ACCESS_TOKEN:
         required: false
       GH_BOT_USER_PAT:
         required: false
