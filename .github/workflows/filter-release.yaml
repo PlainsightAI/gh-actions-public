@@ -50,23 +50,19 @@ on:
         default: ''
       build_secrets:
         description: |
-          Newline-separated lines passed verbatim to docker/build-push-action's
-          `secrets:` input. Each line is a BuildKit secret spec
-          (`id=<id>,env=<ENV_VAR>` or `id=<id>,src=<path>`).
+          Newline-separated lines passed to docker/build-push-action's
+          `secret-envs:` input. Each line maps a BuildKit secret ID to an
+          env var: `SECRET_ID=ENV_VAR`.
 
-          For env-backed secrets, the env var MUST exist in the publish-docker
-          job — typically via `forward_secrets_as_env` + `secrets: inherit` on
-          the caller. Setting `build_secrets: id=foo,env=FOO` without
-          arranging for `FOO` to be present at build time will fail inside
-          BuildKit with an opaque "secret not found" error; the workflow
-          itself cannot detect this misconfiguration.
+          The env var MUST exist in the publish-docker job — typically via
+          `forward_secrets_as_env` + `secrets: inherit` on the caller.
 
           Example for a Dockerfile that uses
           `RUN --mount=type=secret,id=hf_token`:
 
             forward_secrets_as_env: HF_TOKEN
             build_secrets: |
-              id=hf_token,env=HF_TOKEN
+              hf_token=HF_TOKEN
         required: false
         type: string
         default: ''
@@ -373,7 +369,7 @@ jobs:
             ${{ inputs.docker_image }}:${{ needs.prepare-pypi-publish.outputs.package_version }}
             ${{ inputs.docker_image }}:latest
           labels: ${{ steps.meta.outputs.labels }}
-          secrets: ${{ inputs.build_secrets }}
+          secret-envs: ${{ inputs.build_secrets }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
