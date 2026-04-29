@@ -24,7 +24,7 @@ Lifted from the supersede + push + create logic of `client-portal/.github/workfl
 | `commit_message`    | yes      | —         | Commit message for the staged changes. |
 | `pr_title`          | yes      | —         | Pull request title. |
 | `pr_body`           | yes      | —         | Pull request body (markdown). |
-| `gh_token`          | yes      | —         | GitHub token (the plainsight-bot PAT) used for `git push`, `gh pr create`, supersede, and `gh pr merge --auto`. |
+| `gh_token`          | yes      | —         | GitHub token (the plainsight-bot PAT) used for `git push`, `gh pr create`, `gh pr merge --auto`, **and listing/closing prior PRs in the supersede step**. Must have `repo` scope (or equivalent fine-grained `Pull requests: read+write` and `Contents: read+write`) on every repo this action targets. |
 | `auto_merge`        | no       | `'true'`  | Set to `'false'` to skip `gh pr merge --auto`. |
 | `merge_method`      | no       | `'squash'`| Merge method for native auto-merge: `squash` \| `merge` \| `rebase`. |
 | `working_directory` | no       | `'.'`     | Path on the runner to the cloned consumer repo. |
@@ -97,7 +97,8 @@ jobs:
             workdir="/tmp/consumers/${repo##*/}"
             git clone "https://x-access-token:${GH_BOT_USER_PAT}@github.com/${repo}" "$workdir"
             (cd "$workdir" && /github/workspace/scripts/cascade/bump-strategy.sh)
-            echo "REPO=$repo WORKDIR=$workdir" >> "$GITHUB_ENV"
+            echo "REPO=$repo" >> "$GITHUB_ENV"
+            echo "WORKDIR=$workdir" >> "$GITHUB_ENV"
           done < /tmp/consumers.txt
 
       # Per-consumer step (typical pattern: matrix-fan-out, one job per repo)

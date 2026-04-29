@@ -31,7 +31,12 @@ inputs:
     description: "Pull request body (markdown)."
     required: true
   gh_token:
-    description: "GitHub token (plainsight-bot PAT) used for git push, PR creation, and auto-merge enablement."
+    description: |
+      GitHub token (plainsight-bot PAT) used for git push, PR creation,
+      auto-merge enablement, and listing/closing prior PRs in the supersede
+      step. Must have `repo` scope (or equivalent fine-grained
+      `Pull requests: read+write` and `Contents: read+write`) on every repo
+      this action targets.
     required: true
   auto_merge:
     description: "Set to 'false' to skip 'gh pr merge --auto'. Defaults to 'true'."
@@ -66,7 +71,9 @@ runs:
         # strategy already converged (e.g. the consumer's pin already
         # satisfies the new version, or this run is a retry of a no-op).
         # Exit success and let downstream steps short-circuit on has_changes.
-        if git diff --quiet && git diff --cached --quiet; then
+        # Use porcelain so untracked files (e.g. brand-new RELEASE.md) also
+        # count as changes — git diff --quiet only checks tracked files.
+        if [ -z "$(git status --porcelain)" ]; then
           echo "Working tree clean; nothing to commit."
           echo "has_changes=false" >> "$GITHUB_OUTPUT"
         else
@@ -123,7 +130,6 @@ runs:
       working-directory: ${{ inputs.working_directory }}
       env:
         GH_TOKEN: ${{ inputs.gh_token }}
-        REPO: ${{ inputs.repo }}
         BRANCH_PREFIX: ${{ inputs.branch_prefix }}
         COMMIT_MESSAGE: ${{ inputs.commit_message }}
       run: |
