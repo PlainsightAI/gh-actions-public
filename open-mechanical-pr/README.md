@@ -7,8 +7,8 @@ Behavior:
 1. Configure git identity to `plainsight-bot <cloudinfra@plainsight.ai>`.
 2. If the working tree is clean, exit success without doing anything (idempotent re-runs).
 3. List open PRs in the target repo whose head branch starts with `branch_prefix` and close them with a "Superseded by a fresh `${branch_prefix}` run." comment + branch deletion.
-4. Create branch `${branch_prefix}${short_sha}`, commit staged changes with `commit_message`, push to origin (using `gh_token`).
-5. Open the PR against `main` with `pr_title` / `pr_body`.
+4. Create branch `${branch_prefix}${short_sha}-${github_run_id}`, commit working-tree changes (modifications and untracked files) with `commit_message`, push using a token-in-URL (no global git config mutation).
+5. Open the PR against `base_branch` (default `main`) with `pr_title` / `pr_body`. If a PR for the same head branch already exists (e.g. on workflow re-run), reuse it instead of erroring.
 6. If `auto_merge` is `true` (default), call `gh pr merge --auto --${merge_method}` on the new PR. If auto-merge enablement fails (e.g. target branch has no protection rule), log a warning and continue — the PR remains open for manual merge.
 
 Lifted from the supersede + push + create logic of `client-portal/.github/workflows/update-api-client.yaml`, factored once so any cascade workflow can share it.
@@ -20,13 +20,14 @@ Lifted from the supersede + push + create logic of `client-portal/.github/workfl
 | Input               | Required | Default   | Description |
 |---------------------|----------|-----------|-------------|
 | `repo`              | yes      | —         | Target consumer in `owner/name` form (e.g. `PlainsightAI/filter-sam3-detector`). |
-| `branch_prefix`     | yes      | —         | Prefix for the bot PR head branch (e.g. `bump-openfilter-`, `bump-gh-actions-`). Used both to name the new branch and to identify stale predecessors to supersede. **Pick a prefix unique to the cascade** so unrelated bot PRs are not closed. |
+| `branch_prefix`     | yes      | —         | Prefix for the bot PR head branch (e.g. `bump-openfilter-`, `bump-gh-actions-`). Used both to name the new branch (`${branch_prefix}${short_sha}-${github_run_id}`) and to identify stale predecessors to supersede. **Pick a prefix unique to the cascade** so unrelated bot PRs are not closed. |
 | `commit_message`    | yes      | —         | Commit message for the staged changes. |
 | `pr_title`          | yes      | —         | Pull request title. |
 | `pr_body`           | yes      | —         | Pull request body (markdown). |
 | `gh_token`          | yes      | —         | GitHub token (the plainsight-bot PAT) used for `git push`, `gh pr create`, `gh pr merge --auto`, **and listing/closing prior PRs in the supersede step**. Must have `repo` scope (or equivalent fine-grained `Pull requests: read+write` and `Contents: read+write`) on every repo this action targets. |
 | `auto_merge`        | no       | `'true'`  | Set to `'false'` to skip `gh pr merge --auto`. |
-| `merge_method`      | no       | `'squash'`| Merge method for native auto-merge: `squash` \| `merge` \| `rebase`. |
+| `merge_method`      | no       | `'squash'`| Merge method for native auto-merge: `squash` \| `merge` \| `rebase`. Validated unconditionally (in the precheck step) so a typo fails fast even when `auto_merge: 'false'`. |
+| `base_branch`       | no       | `'main'`  | Base branch the PR targets and the supersede step queries against. Defaults to `main`. |
 | `working_directory` | no       | `'.'`     | Path on the runner to the cloned consumer repo. |
 
 ---
@@ -65,7 +66,7 @@ The match is a literal `startswith` against the head branch name. Choose a `bran
 
 ## Example: openfilter cascade caller
 
-A snippet from the openfilter cascade workflow that fans out a bump to one consumer:
+A two-job pattern from the openfilter cascade workflow: a `discover` job emits the list of eligible consumers as a JSON array, and a `cascade` job fans out one matrix shard per consumer. Each shard clones, applies the bump strategy, and invokes `open-mechanical-pr` independently — one PR per repo, opened in parallel.
 
 ```yaml
 # .github/workflows/cascade-on-tag.yaml in openfilter
@@ -75,41 +76,47 @@ on:
     tags: ['v*']
 
 jobs:
-  cascade:
+  discover:
     runs-on: ubuntu-latest
+    outputs:
+      consumers: ${{ steps.list.outputs.consumers }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
+        run: |
+          # Emit a JSON array of repo names, one per matrix shard.
+          consumers=$(./scripts/cascade/discover.sh | jq -Rsn '[inputs | select(length>0)]')
+          echo "consumers=$consumers" >> "$GITHUB_OUTPUT"
+
+  cascade:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.discover.outputs.consumers) }}
     env:
       UPSTREAM_VERSION: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Discover eligible consumers
-        id: discover
-        env:
-          GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
-        run: ./scripts/cascade/discover.sh > /tmp/consumers.txt
-
-      - name: Bump and PR each consumer
+      - name: Clone consumer
         env:
           GH_BOT_USER_PAT: ${{ secrets.GH_BOT_USER_PAT }}
-          UPSTREAM_VERSION: ${{ env.UPSTREAM_VERSION }}
         run: |
-          while read -r repo; do
-            workdir="/tmp/consumers/${repo##*/}"
-            git clone "https://x-access-token:${GH_BOT_USER_PAT}@github.com/${repo}" "$workdir"
-            (cd "$workdir" && /github/workspace/scripts/cascade/bump-strategy.sh)
-            echo "REPO=$repo" >> "$GITHUB_ENV"
-            echo "WORKDIR=$workdir" >> "$GITHUB_ENV"
-          done < /tmp/consumers.txt
+          git clone "https://x-access-token:${GH_BOT_USER_PAT}@github.com/${{ matrix.repo }}" /tmp/consumer
 
-      # Per-consumer step (typical pattern: matrix-fan-out, one job per repo)
+      - name: Apply bump strategy
+        working-directory: /tmp/consumer
+        run: <consumer-specific bump command, e.g. ./scripts/cascade/bump-strategy.sh>
+
       - name: Open mechanical bump PR
         uses: PlainsightAI/gh-actions-public/open-mechanical-pr@main
         with:
-          repo: ${{ env.REPO }}
-          working_directory: ${{ env.WORKDIR }}
+          repo: ${{ matrix.repo }}
+          working_directory: /tmp/consumer
           branch_prefix: bump-openfilter-
-          commit_message: |
-            chore(deps): bump openfilter to ${{ env.UPSTREAM_VERSION }}
+          commit_message: "chore(deps): bump openfilter to ${{ env.UPSTREAM_VERSION }}"
           pr_title: "chore(deps): bump openfilter to ${{ env.UPSTREAM_VERSION }}"
           pr_body: |
             Mechanical bump of `openfilter` to `${{ env.UPSTREAM_VERSION }}`,
@@ -121,9 +128,10 @@ jobs:
           # auto_merge defaults to 'true'; pass 'false' to honor a
           # .github/no-cascade-automerge marker file in the consumer.
           # merge_method defaults to 'squash'.
+          # base_branch defaults to 'main'.
 ```
 
-In production the per-consumer `bump-strategy.sh` + `open-mechanical-pr` invocation is typically wrapped in a matrix-fan-out job so each consumer's PR opens in parallel; the snippet above flattens it to one block for readability.
+`fail-fast: false` matters here: one consumer's bump strategy failing (e.g. a merge conflict in the lockfile) shouldn't cancel the other shards' in-flight PRs. The calling workflow's `if: failure()` Slack/notification step (or equivalent) is the right place to flag systemic problems.
 
 ---
 

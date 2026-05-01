@@ -1,10 +1,11 @@
 name: "Open Mechanical PR"
 description: |
-  Opens a bot-authored pull request from a working tree of staged changes.
-  Supersedes any open PRs whose head branch shares the configured prefix,
-  commits + pushes a fresh branch named ${branch_prefix}${short_sha}, opens
-  the PR, and (by default) enables native auto-merge. Idempotent: a clean
-  working tree exits successfully without doing anything.
+  Opens a bot-authored pull request from working-tree changes (modifications
+  and untracked files). Supersedes any open PRs whose head branch shares the
+  configured prefix, commits + pushes a fresh branch named
+  ${branch_prefix}${short_sha}-${github_run_id}, opens the PR, and (by
+  default) enables native auto-merge. Idempotent: a clean working tree exits
+  successfully without doing anything.
 
   Lifted from the supersede + push + create logic of client-portal's
   update-api-client.yaml so cascade workflows (openfilter, gh-actions, …)
@@ -17,9 +18,9 @@ inputs:
   branch_prefix:
     description: |
       Branch prefix for the bot PR head (e.g. bump-openfilter-, bump-gh-actions-).
-      Used both for the new branch name (${branch_prefix}${short_sha}) and to
-      identify open predecessors to supersede. Pick a prefix unique to the
-      cascade so unrelated bot PRs are not closed.
+      Used both for the new branch name (${branch_prefix}${short_sha}-${github_run_id})
+      and to identify open predecessors to supersede. Pick a prefix unique to
+      the cascade so unrelated bot PRs are not closed.
     required: true
   commit_message:
     description: "Commit message for the staged changes."
@@ -46,6 +47,12 @@ inputs:
     description: "Merge method passed to 'gh pr merge --auto': squash | merge | rebase."
     required: false
     default: 'squash'
+  base_branch:
+    description: |
+      Base branch the PR targets and the supersede step queries against.
+      Defaults to `main`.
+    required: false
+    default: 'main'
   working_directory:
     description: "Path to the cloned consumer repo on the runner. Defaults to the current directory."
     required: false
@@ -63,7 +70,21 @@ runs:
       id: precheck
       shell: bash
       working-directory: ${{ inputs.working_directory }}
+      env:
+        MERGE_METHOD: ${{ inputs.merge_method }}
+        AUTO_MERGE: ${{ inputs.auto_merge }}
       run: |
+        # Validate merge_method unconditionally — even when auto_merge is
+        # 'false', so that a typo in test runs that disable auto-merge fails
+        # fast rather than lurking until someone flips the flag.
+        case "$MERGE_METHOD" in
+          squash|merge|rebase) ;;
+          *)
+            echo "ERROR: invalid merge_method '$MERGE_METHOD' (expected squash|merge|rebase)."
+            exit 1
+            ;;
+        esac
+
         git config user.name "plainsight-bot"
         git config user.email "cloudinfra@plainsight.ai"
 
@@ -88,6 +109,7 @@ runs:
         GH_TOKEN: ${{ inputs.gh_token }}
         REPO: ${{ inputs.repo }}
         BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         # Only one open cascade PR per prefix at a time. Filtering via jq
         # because gh pr list's --search head: qualifier is exact-match, not
@@ -95,14 +117,24 @@ runs:
         # have no other purpose. Pass the prefix via env (BRANCH_PREFIX) so
         # the jq query reads it from $ENV — never inline ${{ inputs.* }}
         # into a shell script (branch names can carry shell metacharacters).
-        mapfile -t stale < <(
-          gh pr list \
-            --repo "$REPO" \
-            --state open \
-            --base main \
-            --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith(env.BRANCH_PREFIX)) | "\(.number)\t\(.headRefName)"'
-        )
+        #
+        # Run gh pr list as its own step rather than inline-piping into
+        # mapfile: a process-substitution failure inside `mapfile -t … < <(…)`
+        # is silently swallowed (mapfile returns 0 with an empty array), so
+        # an auth-scope mismatch or transient API error would masquerade as
+        # "no stale PRs" and let the cascade race against still-open
+        # predecessors. The two-step form surfaces gh's exit code.
+        if ! gh pr list \
+              --repo "$REPO" \
+              --state open \
+              --base "$BASE_BRANCH" \
+              --json number,headRefName \
+              --jq '.[] | select(.headRefName | startswith(env.BRANCH_PREFIX)) | "\(.number)\t\(.headRefName)"' \
+              > /tmp/stale_prs.txt; then
+          echo "WARN: failed to list open PRs in $REPO for supersede check; continuing without supersede."
+          exit 0
+        fi
+        mapfile -t stale < /tmp/stale_prs.txt
 
         if [ "${#stale[@]}" -eq 0 ]; then
           echo "No stale ${BRANCH_PREFIX}* PRs to supersede."
@@ -130,22 +162,36 @@ runs:
       working-directory: ${{ inputs.working_directory }}
       env:
         GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
         BRANCH_PREFIX: ${{ inputs.branch_prefix }}
         COMMIT_MESSAGE: ${{ inputs.commit_message }}
       run: |
         SHORT_SHA=$(git rev-parse --short HEAD)
-        BRANCH_NAME="${BRANCH_PREFIX}${SHORT_SHA}"
+        # Append GITHUB_RUN_ID so two truly concurrent cascade runs against
+        # an unchanged consumer main don't race on push with identical
+        # branch names (SHORT_SHA alone is deterministic per HEAD, not per
+        # run). A re-run of the SAME workflow run keeps the same RUN_ID, so
+        # the PR-existence probe below still handles retry idempotency.
+        BRANCH_NAME="${BRANCH_PREFIX}${SHORT_SHA}-${GITHUB_RUN_ID}"
 
-        git checkout -b "$BRANCH_NAME"
+        # -B (force-create) instead of -b: a re-entrant invocation in the
+        # same workspace (rare, but possible on persistent self-hosted
+        # runners that share a checkout across jobs) would otherwise error
+        # with "branch already exists". Safe here since we're freshly
+        # pushing this branch in the next command anyway.
+        git checkout -B "$BRANCH_NAME"
         git add -A
         git commit -m "$COMMIT_MESSAGE"
 
-        # Authenticate the push via gh's token helper rather than rewriting
-        # the remote URL — keeps the token out of `git remote -v` and the
-        # reflog. gh injects the credential into the libcurl-style helper
-        # chain that git already consults.
-        gh auth setup-git
-        git push origin "$BRANCH_NAME"
+        # Push using the token in the URL — avoids mutating global git
+        # config (which `gh auth setup-git` would do persistently on
+        # self-hosted runners by writing a credential helper into
+        # ~/.gitconfig that survives across jobs and can interfere with
+        # other workflows that authenticate differently). The
+        # `http.extraheader=` override defeats any persisted Authorization
+        # header left by actions/checkout in callers that share a workspace.
+        git -c "http.https://github.com/.extraheader=" \
+            push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$BRANCH_NAME"
 
         echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
@@ -157,18 +203,29 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.gh_token }}
         REPO: ${{ inputs.repo }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
         BRANCH_NAME: ${{ steps.push.outputs.branch_name }}
         PR_TITLE: ${{ inputs.pr_title }}
         PR_BODY: ${{ inputs.pr_body }}
       run: |
-        PR_URL=$(gh pr create \
-          --repo "$REPO" \
-          --base main \
-          --head "$BRANCH_NAME" \
-          --title "$PR_TITLE" \
-          --body "$PR_BODY")
-
-        echo "Opened: $PR_URL"
+        # Probe for an existing PR for this exact branch first. A re-run of
+        # the same workflow run reproduces the same SHORT_SHA + RUN_ID and
+        # therefore the same BRANCH_NAME; the push above is a no-op or
+        # fast-forward, but `gh pr create` would hard-fail with "a pull
+        # request for branch X already exists". Reuse the existing PR
+        # instead so retries are idempotent.
+        PR_URL=$(gh pr list --repo "$REPO" --head "$BRANCH_NAME" --state open --json url --jq '.[0].url // ""')
+        if [ -z "$PR_URL" ]; then
+          PR_URL=$(gh pr create \
+            --repo "$REPO" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH_NAME" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY")
+          echo "Opened: $PR_URL"
+        else
+          echo "Reusing existing PR: $PR_URL"
+        fi
         echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
 
     - name: Enable native auto-merge
@@ -191,14 +248,9 @@ runs:
         # still exists, a human can merge it manually. Failing the cascade
         # over a missing branch protection rule would block bumps from
         # landing in repos that haven't completed the protection sweep yet.
-        case "$MERGE_METHOD" in
-          squash|merge|rebase) ;;
-          *)
-            echo "ERROR: invalid merge_method '$MERGE_METHOD' (expected squash|merge|rebase)."
-            exit 1
-            ;;
-        esac
-
+        #
+        # merge_method validation lives in the precheck step so a typo
+        # fails fast even when auto_merge is 'false'.
         if ! gh pr merge --auto "--$MERGE_METHOD" "$PR_URL"; then
           echo "WARN: 'gh pr merge --auto --$MERGE_METHOD' failed for $PR_URL."
           echo "WARN: Likely cause: target branch has no protection rule, so auto-merge"
