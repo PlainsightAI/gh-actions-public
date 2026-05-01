@@ -72,7 +72,6 @@ runs:
       working-directory: ${{ inputs.working_directory }}
       env:
         MERGE_METHOD: ${{ inputs.merge_method }}
-        AUTO_MERGE: ${{ inputs.auto_merge }}
       run: |
         # Validate merge_method unconditionally — even when auto_merge is
         # 'false', so that a typo in test runs that disable auto-merge fails
