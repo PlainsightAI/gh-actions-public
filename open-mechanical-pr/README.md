@@ -87,7 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
         run: |
           # Emit a JSON array of repo names, one per matrix shard.
-          consumers=$(./scripts/cascade/discover.sh | jq -Rsn '[inputs | select(length>0)]')
+          consumers=$(./scripts/cascade/discover.sh | jq -Rn '[inputs | select(length>0)]')
           echo "consumers=$consumers" >> "$GITHUB_OUTPUT"
 
   cascade:
