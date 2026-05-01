@@ -124,6 +124,15 @@ runs:
         # an auth-scope mismatch or transient API error would masquerade as
         # "no stale PRs" and let the cascade race against still-open
         # predecessors. The two-step form surfaces gh's exit code.
+        #
+        # On gh pr list failure: fail the shard rather than soft-fail. For
+        # internal cascade targets with a scoped bot PAT, a non-zero exit
+        # here means either a transient API blip (re-run clears it) or a
+        # real bug (token scope, repo archived, repo renamed). Soft-failing
+        # would let stale ${BRANCH_PREFIX}* PRs accumulate forever — the
+        # supersede step silently never works while every cascade run opens
+        # fresh PRs on top. Matrix callers should set fail-fast: false so
+        # one shard's failure here doesn't block bumps to peers.
         if ! gh pr list \
               --repo "$REPO" \
               --state open \
@@ -131,8 +140,9 @@ runs:
               --json number,headRefName \
               --jq '.[] | select(.headRefName | startswith(env.BRANCH_PREFIX)) | "\(.number)\t\(.headRefName)"' \
               > /tmp/stale_prs.txt; then
-          echo "WARN: failed to list open PRs in $REPO for supersede check; continuing without supersede."
-          exit 0
+          echo "ERROR: failed to list open PRs in $REPO for supersede check."
+          echo "ERROR: refusing to open a fresh PR on top of an unknown predecessor set."
+          exit 1
         fi
         mapfile -t stale < /tmp/stale_prs.txt
 
