@@ -84,6 +84,28 @@ on:
         required: false
         type: string
         default: 'linux/amd64,linux/arm64'
+      schema_module:
+        description: >
+          Importable Python module path of the filter (e.g.
+          `filter_sam3_detector.filter`). When set, the publish-docker job
+          emits the filter's config schema (and output schema, if declared)
+          via `python -m openfilter.cli emit-schema` inside the pushed
+          image, and attaches them as OCI 1.1 referrer artifacts on the
+          image manifest (FILTER-453). When unset (default), no schema
+          work happens — back-compat for filters that have not migrated
+          to the typed FilterConfigBase / FilterOutputSchema SDK.
+        required: false
+        type: string
+        default: ''
+      schema_class:
+        description: >
+          Optional `ClassName` for emit-schema disambiguation when the
+          module declares more than one matching base subclass. Passed
+          through as the `module:Class` qualifier to `openfilter
+          emit-schema`. Ignored when schema_module is empty.
+        required: false
+        type: string
+        default: ''
     secrets:
       PYPI_API_TOKEN:
         required: false
@@ -372,6 +394,22 @@ jobs:
           secret-envs: ${{ inputs.build_secrets }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # No-op when schema_module is empty — back-compat for filters that
+      # haven't migrated to FilterConfigBase. The composite's
+      # docker run --entrypoint python pulls the runner's-platform variant
+      # from Docker Hub (we're already logged in above) since multi-platform
+      # build-push doesn't load the image into the local daemon.
+      #
+      # Pinned to the current branch during live-test; will re-pin to @main
+      # in a follow-up once this PR merges.
+      - name: Attach config + output schemas (FILTER-453)
+        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@feat/filter-453-attach-schemas-composite
+        with:
+          image: ${{ inputs.docker_image }}
+          version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+          schema_module: ${{ inputs.schema_module }}
+          schema_class: ${{ inputs.schema_class }}
 
   trigger-docs-sync:
     runs-on: ubuntu-latest
