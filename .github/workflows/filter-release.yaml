@@ -188,11 +188,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ inputs.dockerhub_username }}
-          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
+      # No `docker login` here on purpose: `load: true` below keeps the image
+      # in the local daemon and the composite runs against `localhost/filter`,
+      # so nothing pulls or pushes. Skipping login also lets fork PRs run this
+      # job — `DOCKERHUB_TOKEN` isn't passed to fork workflows.
 
       - name: Forward inherited secrets to env
         if: inputs.forward_secrets_as_env != ''
@@ -210,9 +209,9 @@ jobs:
             { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
           done
 
-      # Single-platform load build — image stays in the local daemon under
-      # the same tag the real publish would use, so the composite's
-      # `docker run` resolves locally instead of pulling.
+      # Single-platform load build — image stays in the local daemon under a
+      # local-only namespace (no production repo coordinates), so the
+      # composite's `docker run` resolves locally instead of pulling.
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v6
         with:
@@ -221,7 +220,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ inputs.docker_image }}:pr-${{ github.event.number }}
+          tags: localhost/filter:pr-${{ github.event.number }}
           secret-envs: ${{ inputs.build_secrets }}
           cache-from: type=gha
 
@@ -230,7 +229,7 @@ jobs:
       - name: Emit schemas (dry-run; no attach)
         uses: PlainsightAI/gh-actions-public/attach-filter-schemas@main
         with:
-          image: ${{ inputs.docker_image }}
+          image: localhost/filter
           version: pr-${{ github.event.number }}
           dry_run: "true"
           schema_module: ${{ inputs.schema_module }}
