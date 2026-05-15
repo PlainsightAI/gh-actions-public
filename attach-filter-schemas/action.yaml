@@ -25,10 +25,10 @@ description: >
     * Output-schema emit failure is downgraded to a notice (filters may
       migrate config without output and stay supported).
 
-  Attach is skipped entirely when `dry_run: 'true'`. Schemas are still
-  emitted in dry-run mode so emit failures surface at PR time — that's
-  the whole point of a dry-run-publish job per the DT-146 prevention
-  pattern.
+  Attach is skipped entirely when `dry_run: 'true'`; schemas are still
+  emitted so emit failures surface wherever the dry-run runs. Wiring a
+  PR-time dry-run-publish job that exercises this is opt-in per caller —
+  it's the DT-146 prevention pattern, not the composite's contract.
 
 inputs:
   image:
@@ -38,7 +38,9 @@ inputs:
       (single-platform `load: true` build) or be pullable from the
       registry (multi-platform `push: true` build), because
       `docker run --entrypoint python "${image}:${version}"` is how
-      emit-schema executes.
+      emit-schema executes. For the multi-platform case the caller must
+      already be `docker login`'d to the registry — the implicit pull
+      happens in the composite's step and inherits the runner's login.
     required: true
   version:
     description: >
