@@ -84,6 +84,28 @@ on:
         required: false
         type: string
         default: 'linux/amd64,linux/arm64'
+      schema_module:
+        description: >
+          Importable Python module path of the filter (e.g.
+          `filter_sam3_detector.filter`). When set, the publish-docker job
+          emits the filter's config schema (and output schema, if declared)
+          via `python -m openfilter.cli emit-schema` inside the pushed
+          image, and attaches them as OCI 1.1 referrer artifacts on the
+          image manifest (FILTER-453). When unset (default), no schema
+          work happens — back-compat for filters that have not migrated
+          to the typed FilterConfigBase / FilterOutputSchema SDK.
+        required: false
+        type: string
+        default: ''
+      schema_class:
+        description: >
+          Optional `ClassName` for emit-schema disambiguation when the
+          module declares more than one matching base subclass. Passed
+          through as the `module:Class` qualifier to `openfilter
+          emit-schema`. Ignored when schema_module is empty.
+        required: false
+        type: string
+        default: ''
     secrets:
       PYPI_API_TOKEN:
         required: false
@@ -143,6 +165,75 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  # PR-time prevention path (DT-146 pattern). Mirrors publish-docker's build
+  # preamble with `load: true` + single-platform so the dry-run exercises the
+  # same Dockerfile + composite path as the real publish, but skips the push
+  # and the OCI-attach step. Catches schema misconfigurations and Dockerfile
+  # build regressions before a release is being cut.
+  dry-run-publish:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs: run-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: "PreAction Disk-Cleanup"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          sudo docker builder prune -a --force || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # No `docker login` here on purpose: `load: true` below keeps the image
+      # in the local daemon and the composite runs against `localhost/filter`,
+      # so nothing pulls or pushes. Skipping login also lets fork PRs run this
+      # job — `DOCKERHUB_TOKEN` isn't passed to fork workflows.
+
+      - name: Forward inherited secrets to env
+        if: inputs.forward_secrets_as_env != ''
+        env:
+          ALL_SECRETS: ${{ toJson(secrets) }}
+          NAMES: ${{ inputs.forward_secrets_as_env }}
+        run: |
+          IFS=',' read -ra names <<< "$NAMES"
+          for name in "${names[@]}"; do
+            name="${name//[[:space:]]/}"; [ -z "$name" ] && continue
+            value=$(printf '%s' "$ALL_SECRETS" | jq -r --arg k "$name" '.[$k] // ""')
+            [ -z "$value" ] && { echo "::warning::secret '$name' listed in forward_secrets_as_env but not found in inherited secrets context"; continue; }
+            echo "::add-mask::$value"
+            delim="ghsecret_$(openssl rand -hex 8)"
+            { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+          done
+
+      # Single-platform load build — image stays in the local daemon under a
+      # local-only namespace (no production repo coordinates), so the
+      # composite's `docker run` resolves locally instead of pulling.
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: localhost/filter:pr-${{ github.event.number }}
+          secret-envs: ${{ inputs.build_secrets }}
+          cache-from: type=gha
+
+      # Emit-only — attach is skipped via dry_run. No-op when schema_module
+      # is empty (filters that haven't migrated to FilterConfigBase).
+      - name: Emit schemas (dry-run; no attach)
+        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@main
+        with:
+          image: localhost/filter
+          version: pr-${{ github.event.number }}
+          dry_run: "true"
+          schema_module: ${{ inputs.schema_module }}
+          schema_class: ${{ inputs.schema_class }}
 
   create-release:
     if: github.ref == 'refs/heads/main'
@@ -372,6 +463,19 @@ jobs:
           secret-envs: ${{ inputs.build_secrets }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # No-op when schema_module is empty — back-compat for filters that
+      # haven't migrated to FilterConfigBase. The composite's
+      # docker run --entrypoint python pulls the runner's-platform variant
+      # from Docker Hub (we're already logged in above) since multi-platform
+      # build-push doesn't load the image into the local daemon.
+      - name: Attach config + output schemas (FILTER-453)
+        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@main
+        with:
+          image: ${{ inputs.docker_image }}
+          version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+          schema_module: ${{ inputs.schema_module }}
+          schema_class: ${{ inputs.schema_class }}
 
   trigger-docs-sync:
     runs-on: ubuntu-latest

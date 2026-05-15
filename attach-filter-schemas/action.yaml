@@ -1,0 +1,203 @@
+name: "Attach Filter Schemas"
+description: >
+  Emits an OpenFilter filter's JSON Schema(s) and attaches them as OCI 1.1
+  referrer artifacts on the pushed image manifest (FILTER-453 / FC-3 schema
+  transport).
+
+  This composite is intentionally registry-agnostic — the schema attach
+  mechanics are the same for Docker Hub, GAR, GHCR, or any other OCI 1.1
+  registry. Calling jobs are responsible for building (and, when not in
+  dry-run, pushing) the image; this composite handles only the
+  emit + validate + attach slice. Called by:
+
+    * PlainsightAI/gh-actions-public/.github/workflows/filter-release.yaml
+      after docker/build-push-action (Docker Hub releases).
+    * PlainsightAI/gh-actions/publish-gar-image after make publish-image
+      (GAR releases, private + premium).
+
+  When `schema_module` is empty the composite is a no-op — filters that
+  have not migrated to the typed FilterConfigBase / FilterOutputSchema SDK
+  release exactly as before.
+
+  Emit-failure asymmetry mirrors the SDK contract:
+    * Config-schema emit failure is fatal (a filter that declared
+      `schema_module` must produce a config schema).
+    * Output-schema emit failure is downgraded to a notice (filters may
+      migrate config without output and stay supported).
+
+  Attach is skipped entirely when `dry_run: 'true'`; schemas are still
+  emitted so emit failures surface wherever the dry-run runs. Wiring a
+  PR-time dry-run-publish job that exercises this is opt-in per caller —
+  it's the DT-146 prevention pattern, not the composite's contract.
+
+inputs:
+  image:
+    description: >
+      Full image path the schemas should attach to, including registry
+      and repository but no tag. Must already exist locally
+      (single-platform `load: true` build) or be pullable from the
+      registry (multi-platform `push: true` build), because
+      `docker run --entrypoint python "${image}:${version}"` is how
+      emit-schema executes. For the multi-platform case the caller must
+      already be `docker login`'d to the registry — the implicit pull
+      happens in the composite's step and inherits the runner's login.
+    required: true
+  version:
+    description: >
+      Image tag the schemas should attach to. Schemas are attached as
+      OCI referrers with `subject: ${image}:${version}`.
+    required: true
+  dry_run:
+    description: >
+      When 'true', schemas are emitted (to surface emission failures at
+      PR time) but not attached to a remote manifest. Default 'false'.
+    required: false
+    default: "false"
+  schema_module:
+    description: >
+      Importable Python module path of the filter (e.g.
+      `filter_sam3_detector.filter`). When set, this composite emits the
+      filter's config schema — and, when declared, its output schema —
+      via `python -m openfilter.cli emit-schema` inside the just-built
+      image, and attaches each as an OCI referrer on the pushed
+      manifest. When unset (default), the composite is a no-op —
+      back-compat for filters that have not migrated to the typed
+      `FilterConfigBase` / `FilterOutputSchema` SDK surface.
+    required: false
+    default: ""
+  schema_class:
+    description: >
+      Optional `ClassName` for emit-schema disambiguation when the module
+      declares more than one matching base subclass. Passed through as
+      the `module:Class` qualifier to `openfilter emit-schema`. Ignored
+      when `schema_module` is empty.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # Emit schemas against the built image so the filter's deps (including
+    # openfilter itself) are guaranteed to be present without touching the
+    # runner's Python env. `--entrypoint python` overrides the filter's
+    # runtime entrypoint so we can invoke the CLI module directly.
+    #
+    # For multi-platform pushed images (Docker Hub path), the image is not
+    # in the local daemon and `docker run` will pull the runner's-platform
+    # variant from the registry — adds a pull, but emit-schema is platform-
+    # agnostic so any variant produces an equivalent schema.
+    - name: Emit config schema
+      id: emit_config
+      if: inputs.schema_module != ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+        SCHEMA_MODULE: ${{ inputs.schema_module }}
+        SCHEMA_CLASS: ${{ inputs.schema_class }}
+        SCHEMA_PATH: ${{ runner.temp }}/config-schema.json
+      run: |
+        set -euo pipefail
+        spec="$SCHEMA_MODULE"
+        [ -n "$SCHEMA_CLASS" ] && spec="${spec}:${SCHEMA_CLASS}"
+        if timeout 60 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
+            -m openfilter.cli emit-schema --kind config "$spec" \
+            > "$SCHEMA_PATH" 2> "${RUNNER_TEMP}/emit-config.err"; then
+          # Guard against a 0-exit with empty/invalid stdout (disk full,
+          # upstream bug, etc.) — we'd otherwise publish a broken schema
+          # as authoritative.
+          if ! jq -e . "$SCHEMA_PATH" > /dev/null 2>&1; then
+            echo "::error::config schema emit returned 0 but produced invalid JSON for ${SCHEMA_MODULE}"
+            head -c 4096 "$SCHEMA_PATH" || true
+            exit 1
+          fi
+          echo "path=$SCHEMA_PATH" >> "$GITHUB_OUTPUT"
+          echo "emitted=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::config schema emit failed for ${SCHEMA_MODULE}"
+          cat "${RUNNER_TEMP}/emit-config.err"
+          exit 1
+        fi
+
+    # Output schema is optional — filters not yet migrated to
+    # FilterOutputSchema don't declare one, and that's not a release
+    # failure. We can't distinguish "no FilterOutputSchema declared" from
+    # "emit-schema crashed" from exit status alone, so use neutral
+    # wording in the annotation.
+    - name: Emit output schema
+      id: emit_output
+      if: inputs.schema_module != ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+        SCHEMA_MODULE: ${{ inputs.schema_module }}
+        SCHEMA_CLASS: ${{ inputs.schema_class }}
+        SCHEMA_PATH: ${{ runner.temp }}/output-schema.json
+      run: |
+        set -euo pipefail
+        spec="$SCHEMA_MODULE"
+        [ -n "$SCHEMA_CLASS" ] && spec="${spec}:${SCHEMA_CLASS}"
+        if timeout 60 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
+            -m openfilter.cli emit-schema --kind output "$spec" \
+            > "$SCHEMA_PATH" 2> "${RUNNER_TEMP}/emit-output.err"; then
+          if ! jq -e . "$SCHEMA_PATH" > /dev/null 2>&1; then
+            echo "::notice::output schema emit returned 0 but produced invalid JSON for ${SCHEMA_MODULE} (continuing — output schema is optional)"
+            head -c 4096 "$SCHEMA_PATH" || true
+            rm -f "$SCHEMA_PATH"
+            echo "emitted=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$SCHEMA_PATH" >> "$GITHUB_OUTPUT"
+            echo "emitted=true" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "::notice::output schema emit returned non-zero for ${SCHEMA_MODULE} (continuing — output schema is optional). Stderr:"
+          cat "${RUNNER_TEMP}/emit-output.err" || true
+          rm -f "$SCHEMA_PATH"
+          echo "emitted=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Schema attachment requires a pushed image manifest as the subject —
+    # skip during dry-run since the image may only exist locally.
+    - name: Set up ORAS
+      if: |
+        inputs.dry_run != 'true' && inputs.schema_module != ''
+        && (steps.emit_config.outputs.emitted == 'true' || steps.emit_output.outputs.emitted == 'true')
+      uses: oras-project/setup-oras@v1
+
+    # oras attach refuses absolute file paths by default; even with
+    # --disable-path-validation, the absolute path is embedded in the
+    # layer's `org.opencontainers.image.title` annotation, which then
+    # forces every consumer to pass `--allow-path-traversal` to `oras
+    # pull`. Working around that by cd-ing into the schema's directory
+    # so the title annotation is just the basename — registry-clean and
+    # round-trips through `oras pull` with no flags.
+    - name: Attach config schema as OCI referrer
+      if: inputs.dry_run != 'true' && steps.emit_config.outputs.emitted == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+        SCHEMA_PATH: ${{ steps.emit_config.outputs.path }}
+      run: |
+        set -euo pipefail
+        cd "$(dirname "${SCHEMA_PATH}")"
+        oras attach \
+          --artifact-type application/vnd.openfilter.config-schema+json \
+          "${IMAGE}:${VERSION}" \
+          "$(basename "${SCHEMA_PATH}"):application/vnd.openfilter.config-schema+json"
+
+    - name: Attach output schema as OCI referrer
+      if: inputs.dry_run != 'true' && steps.emit_output.outputs.emitted == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+        SCHEMA_PATH: ${{ steps.emit_output.outputs.path }}
+      run: |
+        set -euo pipefail
+        cd "$(dirname "${SCHEMA_PATH}")"
+        oras attach \
+          --artifact-type application/vnd.openfilter.output-schema+json \
+          "${IMAGE}:${VERSION}" \
+          "$(basename "${SCHEMA_PATH}"):application/vnd.openfilter.output-schema+json"
