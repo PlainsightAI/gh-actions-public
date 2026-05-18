@@ -113,6 +113,13 @@ on:
         required: false
       GH_BOT_USER_PAT:
         required: false
+      SLACK_WEBHOOK_URL:
+        description: |
+          Optional Slack incoming-webhook URL — passed through to the
+          cascade-pipeline-bumps reusable workflow (PLAT-1052) for the
+          failure notification job. Missing → cascade failures surface
+          only in the Actions run summary.
+        required: false
 
 permissions:
   contents: write
@@ -476,6 +483,56 @@ jobs:
           version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
           schema_module: ${{ inputs.schema_module }}
           schema_class: ${{ inputs.schema_class }}
+
+  # Probe whether the cascade can run before invoking the called
+  # workflow — GitHub Actions has no first-class "is this secret set?"
+  # check, and the cascade workflow declares GH_BOT_USER_PAT as required.
+  # An always-fail "required secret missing" run for filter-* repos that
+  # haven't onboarded the bot would be noise; gating via this output
+  # keeps those repos' releases green.
+  cascade-gate:
+    runs-on: ubuntu-latest
+    needs: [create-release, publish-docker]
+    if: needs.create-release.outputs.is_release_created == 'true' && needs.publish-docker.result == 'success'
+    outputs:
+      should_cascade: ${{ steps.probe.outputs.should_cascade }}
+    steps:
+      - id: probe
+        env:
+          GH_BOT_USER_PAT: ${{ secrets.GH_BOT_USER_PAT }}
+          IS_PRODUCTION_RELEASE: ${{ needs.create-release.outputs.is_production_release }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_BOT_USER_PAT:-}" ]]; then
+            echo "::notice::GH_BOT_USER_PAT not configured; pipeline-bump cascade (PLAT-1052) will not run for this release."
+            echo "should_cascade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Mirror the first-level cascade's gating: only production
+          # releases cascade. A dev/prerelease tag publishing a
+          # `*-dev` Docker image should not rewrite production consumer
+          # pins to a non-prod coordinate.
+          if [[ "${IS_PRODUCTION_RELEASE}" != "true" ]]; then
+            echo "Release is not flagged production (is_production_release='${IS_PRODUCTION_RELEASE}'); skipping cascade."
+            echo "should_cascade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_cascade=true" >> "$GITHUB_OUTPUT"
+
+  # Second-level cascade: bump filter image pins in every consumer that
+  # tracks this filter (jester-pipelines, openfilter-pipelines-controller,
+  # eval-demo-pipelines). Mirrors the first-level cascade's contract
+  # (matrix fan-out, fail-fast: false, Slack-on-failure). See
+  # docs/cascade/consumer-surface.md for the enumerated consumer set.
+  # PLAT-1052.
+  cascade-pipeline-bumps:
+    needs: [prepare-pypi-publish, cascade-gate]
+    if: needs.cascade-gate.outputs.should_cascade == 'true'
+    uses: PlainsightAI/gh-actions-public/.github/workflows/cascade-pipeline-bumps.yaml@main
+    with:
+      docker_image: ${{ inputs.docker_image }}
+      version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+    secrets: inherit
 
   trigger-docs-sync:
     runs-on: ubuntu-latest
