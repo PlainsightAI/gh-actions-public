@@ -1,0 +1,181 @@
+name: "Cascade Pipeline Bumps — Prepare Bump"
+description: |
+  Stage a consumer-repo clone for a filter-image bump PR. Clones the
+  consumer via the plainsight-bot PAT, runs bump-strategy.sh against the
+  clone to rewrite every matching pin to the authoritative new upstream
+  coordinate, and emits clone_dir / has_changes / commit_message /
+  pr_title / pr_body for the caller to feed into open-mechanical-pr.
+
+  Does NOT push, open, or merge the PR — that is open-mechanical-pr's
+  job. Splitting the two keeps PR mechanics shared with the first-level
+  cascade (openfilter → filter-* source bumps) and the bump strategy
+  scoped to this cascade.
+
+  PLAT-1052: https://plainsight-ai.atlassian.net/browse/PLAT-1052
+
+inputs:
+  consumer_repo:
+    description: |
+      Target consumer repo in `owner/name` form (e.g.
+      `PlainsightAI/jester-pipelines`). The action clones this repo at
+      the default branch tip and runs the bump strategy against it.
+    required: true
+  filter_name:
+    description: |
+      Repo basename of the released filter (e.g. `filter-faceblur`).
+      The bump rewriter scans tracked YAML in the consumer clone for
+      image pins whose trailing path component matches this name,
+      registry-agnostic.
+    required: true
+  new_image_coord:
+    description: |
+      The authoritative new image coordinate to write into the consumer,
+      in `<repo>:<tag>` form (e.g. `plainsightai/filter-faceblur:0.1.5`).
+      Registry follows the upstream's release channel — if a consumer
+      had stale pins under a different registry (e.g. an old GAR mirror),
+      they are rewritten to this exact coordinate, not preserved.
+    required: true
+  version:
+    description: |
+      Bare version of the new release (e.g. `0.1.5`). Used in commit and
+      PR text; the bump rewriter does NOT consume this — it just embeds
+      it in human-facing strings.
+    required: true
+  release_url:
+    description: |
+      URL of the upstream filter's release page (e.g.
+      `https://github.com/PlainsightAI/filter-faceblur/releases/tag/v0.1.5`).
+      Linked in the PR body.
+    required: true
+  gh_token:
+    description: |
+      GitHub token (plainsight-bot PAT) used to clone the consumer repo.
+      Must have read access to the consumer; the subsequent
+      open-mechanical-pr call uses the same token for push + PR creation
+      + auto-merge enablement, so it must also have write access there.
+    required: true
+
+outputs:
+  has_changes:
+    description: "'true' if the bump rewrote at least one pin, 'false' for a clean no-op."
+    value: ${{ steps.bump.outputs.has_changes }}
+  clone_dir:
+    description: "Path on the runner to the staged consumer clone (working tree carries the rewritten pins)."
+    value: ${{ steps.clone.outputs.clone_dir }}
+  commit_message:
+    description: "Suggested commit message for the staged changes — feed to open-mechanical-pr."
+    value: ${{ steps.bump.outputs.commit_message }}
+  pr_title:
+    description: "Suggested PR title — feed to open-mechanical-pr."
+    value: ${{ steps.bump.outputs.pr_title }}
+  pr_body:
+    description: "Suggested PR body (markdown) — feed to open-mechanical-pr."
+    value: ${{ steps.bump.outputs.pr_body }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Clone consumer repo
+      id: clone
+      shell: bash
+      env:
+        GH_BOT_USER_PAT: ${{ inputs.gh_token }}
+        CONSUMER_REPO: ${{ inputs.consumer_repo }}
+      run: |
+        set -euo pipefail
+
+        TEMP_BASE="${RUNNER_TEMP:-/tmp}"
+        # Sanitize consumer slug for the temp-dir suffix — owner/name
+        # has a / which mktemp's XXXXXX template doesn't like in the
+        # leading segment, and we don't want path traversal via a
+        # malicious input either.
+        SLUG=$(printf '%s' "${CONSUMER_REPO}" | tr '/' '-')
+        CLONE_DIR=$(mktemp -d "${TEMP_BASE}/cascade-${SLUG}.XXXXXX")
+
+        # GIT_ASKPASS keeps the PAT out of subprocess argv (where
+        # ACTIONS_STEP_DEBUG would otherwise log it).
+        ASKPASS=$(mktemp "${TEMP_BASE}/cascade-askpass.XXXXXX")
+        chmod 700 "${ASKPASS}"
+        cat > "${ASKPASS}" <<'ASKPASS_SH'
+        #!/usr/bin/env bash
+        case "$1" in
+          Username*) printf 'x-access-token\n' ;;
+          Password*) printf '%s\n' "${GH_BOT_USER_PAT}" ;;
+        esac
+        ASKPASS_SH
+        # `trap` inside a composite action's `run:` is scoped to this
+        # step's shell — fine, the ASKPASS goes away after the step.
+        trap 'rm -f "${ASKPASS}"' EXIT
+
+        GIT_ASKPASS="${ASKPASS}" GIT_TERMINAL_PROMPT=0 \
+          git clone --depth 1 "https://github.com/${CONSUMER_REPO}.git" "${CLONE_DIR}"
+
+        echo "clone_dir=${CLONE_DIR}" >> "$GITHUB_OUTPUT"
+
+    - name: Run bump strategy
+      id: bump
+      shell: bash
+      env:
+        CLONE_DIR: ${{ steps.clone.outputs.clone_dir }}
+        FILTER_NAME: ${{ inputs.filter_name }}
+        NEW_IMAGE_COORD: ${{ inputs.new_image_coord }}
+        VERSION: ${{ inputs.version }}
+        RELEASE_URL: ${{ inputs.release_url }}
+        CONSUMER_REPO: ${{ inputs.consumer_repo }}
+        # ${{ github.action_path }} resolves to the directory holding
+        # this composite's action.yaml — bump-strategy.sh lives next to
+        # it. Quoting is mandatory; on some runners the path contains
+        # spaces.
+        BUMP_STRATEGY: "${{ github.action_path }}/bump-strategy.sh"
+      run: |
+        set -euo pipefail
+
+        # Run in a subshell so the cd doesn't leak. `git ls-files` inside
+        # bump-strategy is anchored on $(pwd), so the cd is required.
+        (
+          cd "${CLONE_DIR}"
+          FILTER_NAME="${FILTER_NAME}" \
+            NEW_IMAGE_COORD="${NEW_IMAGE_COORD}" \
+            bash "${BUMP_STRATEGY}"
+        )
+
+        HAS_CHANGES=false
+        if (cd "${CLONE_DIR}" && [[ -n "$(git status --porcelain)" ]]); then
+          HAS_CHANGES=true
+        fi
+        echo "has_changes=${HAS_CHANGES}" >> "$GITHUB_OUTPUT"
+
+        if [[ "${HAS_CHANGES}" != "true" ]]; then
+          echo "No pin changes in ${CONSUMER_REPO} for ${FILTER_NAME} → ${NEW_IMAGE_COORD}. Skipping PR."
+          exit 0
+        fi
+
+        COMMIT_MSG="chore(deps): bump ${FILTER_NAME} pins to ${VERSION}"
+
+        PR_TITLE="${COMMIT_MSG}"
+
+        # Heredoc body — $GITHUB_OUTPUT requires multi-line values to
+        # use a delimiter trick. The delimiter is randomized in case
+        # the PR body legitimately contains the literal `EOF`.
+        DELIM="cascade_$(openssl rand -hex 6)"
+        {
+          printf 'pr_body<<%s\n' "${DELIM}"
+          cat <<PR_BODY
+        Mechanical bump of \`${FILTER_NAME}\` image pins to [\`${VERSION}\`](${RELEASE_URL}).
+
+        Rewrites every tracked \`image:\` pin whose trailing path component matches \`${FILTER_NAME}\` to the new authoritative coordinate \`${NEW_IMAGE_COORD}\`. Registry-agnostic — stale pins from any old registry mirror are rewritten to the upstream's current release channel.
+
+        Skipped (intentionally):
+        - \`:latest\` pins (intent: track tip)
+        - \`:local\` / \`:*-local\` pins (developer fixtures)
+        - lines carrying a flux \`\$imagepolicy\` marker (reconciler-managed)
+
+        Cascaded from \`${FILTER_NAME}\` [\`${VERSION}\`](${RELEASE_URL}). Tracking: [PLAT-1052](https://plainsight-ai.atlassian.net/browse/PLAT-1052).
+
+        Auto-merge is enabled. The PR lands once required status checks pass on this consumer's branch protection.
+        PR_BODY
+          printf '%s\n' "${DELIM}"
+        } >> "$GITHUB_OUTPUT"
+
+        printf 'commit_message=%s\n' "${COMMIT_MSG}" >> "$GITHUB_OUTPUT"
+        printf 'pr_title=%s\n' "${PR_TITLE}" >> "$GITHUB_OUTPUT"

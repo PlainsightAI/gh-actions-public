@@ -1,0 +1,294 @@
+# cascade-pipeline-bumps.yaml — On a filter image release, open
+# mechanical bump PRs against every consumer that pins that filter's
+# image. Called as a `workflow_call` from filter-release.yaml (which is
+# itself called by each filter-* repo's release workflow), so this fires
+# once per filter-* release publish — no per-repo workflow file needed.
+#
+# Surface enumerated in docs/cascade/consumer-surface.md. Matrix is
+# hardcoded here rather than discovered at runtime: the consumer set is
+# small and stable, and runtime discovery would require an org-scoped
+# token + a marker-file scan per release. When the set changes, add a
+# row to the matrix below.
+#
+# PLAT-1052: https://plainsight-ai.atlassian.net/browse/PLAT-1052
+name: Cascade pipeline bumps
+
+on:
+  workflow_call:
+    inputs:
+      docker_image:
+        description: |
+          Docker image (`<repo>` without tag) of the just-published
+          filter, e.g. `plainsightai/openfilter-faceblur`. Used to derive
+          the filter_name (trailing path component) and the new image
+          coordinate (combined with `version`).
+        required: true
+        type: string
+      version:
+        description: Bare release semver (e.g. `0.1.5`).
+        required: true
+        type: string
+      dry_run:
+        description: |
+          Plan only — run discovery and the bump strategy, log which
+          consumers would receive a PR, but do not call
+          open-mechanical-pr. Surfaced only via workflow_dispatch on
+          the caller; the release-driven path is always live.
+        required: false
+        type: boolean
+        default: false
+      single_consumer:
+        description: |
+          Restrict the cascade to one consumer (e.g.
+          `PlainsightAI/jester-pipelines`). Useful for cautious rollout
+          when a new bump strategy lands. Empty string = all consumers.
+        required: false
+        type: string
+        default: ''
+      auto_merge_override:
+        description: |
+          Open PRs but skip `gh pr merge --auto` enablement — leaves
+          each PR open for manual merge. Smoke-testing only; the
+          release-driven path defaults to auto-merge on.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GH_BOT_USER_PAT:
+        description: |
+          plainsight-bot PAT. Must have read access to every consumer
+          repo (for clone) and write access (for push, PR creation,
+          auto-merge enablement) via open-mechanical-pr.
+        required: true
+      SLACK_WEBHOOK_URL:
+        description: |
+          Incoming-webhook URL for the failure-notification Slack
+          channel. Optional — when unset, the notify job no-ops with
+          a warning so failures surface only in the Actions run
+          summary.
+        required: false
+  # Manual entry point for smoke-testing the cascade without cutting a
+  # real filter release. Inputs mirror workflow_call; defaults bias
+  # toward safe exercise (dry_run: true, auto_merge_override: true) so
+  # an Actions-UI fire from gh-actions-public never opens or merges a
+  # PR by accident. Secrets resolve from this repo's secret store, so
+  # GH_BOT_USER_PAT must be configured on gh-actions-public.
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker image (`<repo>` without tag), e.g. `plainsightai/openfilter-faceblur`.'
+        required: true
+        type: string
+      version:
+        description: 'Bare release semver, e.g. `0.1.5`.'
+        required: true
+        type: string
+      dry_run:
+        description: Plan only — log planned bump PRs without calling open-mechanical-pr.
+        required: false
+        type: boolean
+        default: true
+      single_consumer:
+        description: 'Restrict to one consumer (e.g. `PlainsightAI/jester-pipelines`). Empty = all.'
+        required: false
+        type: string
+        default: ''
+      auto_merge_override:
+        description: Open PRs but skip auto-merge enablement (leaves PRs open for manual review).
+        required: false
+        type: boolean
+        default: true
+
+# Queue per upstream filter — a faceblur release should not cancel an
+# in-flight frame-dedup cascade, but two faceblur releases firing close
+# together (e.g. patch series) should serialize so the second's
+# supersede-stale logic in open-mechanical-pr sees the first's PR.
+concurrency:
+  group: cascade-pipeline-bumps-${{ inputs.docker_image }}
+  cancel-in-progress: false
+
+jobs:
+  # Phase 1 — derive cascade inputs + filter the consumer matrix.
+  # Hardcoded matrix lives in the bump job below; this job's role is to
+  # extract filter_name from docker_image, build new_image_coord, and
+  # decide whether to skip the cascade entirely (single_consumer set to
+  # a value not in the matrix → no shards → no PRs).
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      filter_name: ${{ steps.derive.outputs.filter_name }}
+      new_image_coord: ${{ steps.derive.outputs.new_image_coord }}
+      release_url: ${{ steps.derive.outputs.release_url }}
+    steps:
+      - name: Derive cascade inputs
+        id: derive
+        env:
+          DOCKER_IMAGE: ${{ inputs.docker_image }}
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Filter name = trailing path component of docker_image.
+          # `plainsightai/openfilter-faceblur` → `openfilter-faceblur`.
+          # Single-segment (no slash) is rejected — every filter image
+          # we publish carries at minimum an org prefix.
+          if [[ "${DOCKER_IMAGE}" != */* ]]; then
+            echo "ERROR: docker_image='${DOCKER_IMAGE}' is single-segment; expected <namespace>/<filter-name>." >&2
+            exit 1
+          fi
+          FILTER_NAME="${DOCKER_IMAGE##*/}"
+
+          # Sanity gate — only cascade for filter image names. Public
+          # (open) filters publish to DockerHub as `openfilter-<name>`;
+          # private/premium filters publish to GAR as `filter-<name>`.
+          # Accept both: this workflow rides the public filter-release.yaml
+          # today (every pin openfilter-pipelines-controller tracks is an
+          # `openfilter-*` coordinate), and matching `filter-*` too keeps
+          # it correct if it is ever wired into the premium release path.
+          # A non-filter image pushed through filter-release.yaml (e.g. a
+          # docs image) falls through here to the no-op rather than
+          # misfiring.
+          if [[ "${FILTER_NAME}" != filter-* && "${FILTER_NAME}" != openfilter-* ]]; then
+            echo "filter_name='${FILTER_NAME}' is not a filter image name (expected openfilter-* or filter-*); cascade is a no-op."
+            echo "filter_name=" >> "$GITHUB_OUTPUT"
+            echo "new_image_coord=" >> "$GITHUB_OUTPUT"
+            echo "release_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEW_IMAGE_COORD="${DOCKER_IMAGE}:${VERSION}"
+          # The publishing repo's release page is the natural pointer
+          # for the PR body. `github.repository` is the caller's repo
+          # when this workflow is invoked via workflow_call.
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
+
+          echo "filter_name=${FILTER_NAME}" >> "$GITHUB_OUTPUT"
+          echo "new_image_coord=${NEW_IMAGE_COORD}" >> "$GITHUB_OUTPUT"
+          echo "release_url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
+
+  # Phase 2 — per-consumer bump. One matrix shard per pin-bearing repo.
+  # See docs/cascade/consumer-surface.md for why these three are the
+  # full PR-walkable surface; runtime discovery is intentionally not
+  # used here (rationale at top of this file).
+  bump:
+    if: needs.prepare.outputs.filter_name != ''
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        consumer:
+          - PlainsightAI/jester-pipelines
+          - PlainsightAI/openfilter-pipelines-controller
+          - PlainsightAI/eval-demo-pipelines
+    steps:
+      - name: Skip if outside single_consumer scope
+        id: scope
+        env:
+          CONSUMER: ${{ matrix.consumer }}
+          SINGLE_CONSUMER: ${{ inputs.single_consumer }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SINGLE_CONSUMER}" && "${SINGLE_CONSUMER}" != "${CONSUMER}" ]]; then
+            echo "single_consumer='${SINGLE_CONSUMER}' set; skipping ${CONSUMER}."
+            echo "in_scope=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "in_scope=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare bump
+        id: prep
+        if: steps.scope.outputs.in_scope == 'true'
+        uses: PlainsightAI/gh-actions-public/cascade-pipeline-bumps@main
+        with:
+          consumer_repo: ${{ matrix.consumer }}
+          filter_name: ${{ needs.prepare.outputs.filter_name }}
+          new_image_coord: ${{ needs.prepare.outputs.new_image_coord }}
+          version: ${{ inputs.version }}
+          release_url: ${{ needs.prepare.outputs.release_url }}
+          gh_token: ${{ secrets.GH_BOT_USER_PAT }}
+
+      - name: Log dry-run plan
+        if: steps.scope.outputs.in_scope == 'true' && inputs.dry_run && steps.prep.outputs.has_changes == 'true'
+        env:
+          CONSUMER: ${{ matrix.consumer }}
+          FILTER_NAME: ${{ needs.prepare.outputs.filter_name }}
+          NEW_COORD: ${{ needs.prepare.outputs.new_image_coord }}
+        run: |
+          echo "DRY RUN: would open PR against ${CONSUMER} rewriting ${FILTER_NAME} pins to ${NEW_COORD}."
+
+      - name: Open mechanical PR
+        if: steps.scope.outputs.in_scope == 'true' && steps.prep.outputs.has_changes == 'true' && !inputs.dry_run
+        uses: PlainsightAI/gh-actions-public/open-mechanical-pr@main
+        with:
+          repo: ${{ matrix.consumer }}
+          working_directory: ${{ steps.prep.outputs.clone_dir }}
+          # Per-filter prefix so the supersede-stale logic in
+          # open-mechanical-pr scopes correctly — a faceblur release
+          # should not close an in-flight frame-dedup bump PR.
+          branch_prefix: bump-${{ needs.prepare.outputs.filter_name }}-
+          commit_message: ${{ steps.prep.outputs.commit_message }}
+          pr_title: ${{ steps.prep.outputs.pr_title }}
+          pr_body: ${{ steps.prep.outputs.pr_body }}
+          gh_token: ${{ secrets.GH_BOT_USER_PAT }}
+          auto_merge: ${{ inputs.auto_merge_override && 'false' || 'true' }}
+
+  # Phase 3 — Slack on failure. Block Kit shape matches the first-level
+  # cascade (openfilter/.github/workflows/cascade-on-tag.yaml) so the
+  # two cascades' failure messages read uniformly in the channel.
+  #
+  # Gate is `failure()` alone (no `filter_name != ''` guard): the
+  # non-`filter-*` no-op exits prepare with status 0 and skips bump via
+  # its own `if:` — `failure()` is already false in that case. Guarding
+  # on filter_name would silently swallow the prepare-exit-1 path
+  # (single-segment docker_image, line ~108) where filter_name is never
+  # written; better to let that surface on Slack.
+  notify:
+    if: failure()
+    needs: [prepare, bump]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    # `secrets.X != ''` works in step `if:` for workflow_call workflows;
+    # `env.X` would not (step-level env is not yet bound at if-eval time).
+    # Done via an explicit env-export step rather than two probe-and-act
+    # steps so the boolean lives in one place.
+    env:
+      HAS_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL != '' && 'true' || 'false' }}
+    steps:
+      - name: Slack on failure
+        if: env.HAS_WEBHOOK == 'true'
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            blocks:
+              - type: "header"
+                text:
+                  type: "plain_text"
+                  text: ":openfilter: pipeline-bump cascade errored"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "Cascading `${{ needs.prepare.outputs.filter_name || inputs.docker_image }}` `${{ inputs.version }}` to pipeline-manifest consumers failed. A human needs to investigate before the next release, otherwise consumers will not pick up the new image."
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "Release: <${{ needs.prepare.outputs.release_url || format('https://github.com/{0}', github.repository) }}|${{ needs.prepare.outputs.filter_name || inputs.docker_image }} ${{ inputs.version }}>"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "Workflow: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.workflow }} – Run #${{ github.run_number }}>"
+      - name: Note missing webhook
+        if: env.HAS_WEBHOOK == 'false'
+        run: |
+          echo "::warning::SLACK_WEBHOOK_URL not configured; cascade failure goes unnotified on Slack — visible only in the Actions run summary."
