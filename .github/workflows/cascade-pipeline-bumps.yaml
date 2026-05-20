@@ -67,6 +67,37 @@ on:
           a warning so failures surface only in the Actions run
           summary.
         required: false
+  # Manual entry point for smoke-testing the cascade without cutting a
+  # real filter release. Inputs mirror workflow_call; defaults bias
+  # toward safe exercise (dry_run: true, auto_merge_override: true) so
+  # an Actions-UI fire from gh-actions-public never opens or merges a
+  # PR by accident. Secrets resolve from this repo's secret store, so
+  # GH_BOT_USER_PAT must be configured on gh-actions-public.
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker image (`<repo>` without tag), e.g. `plainsightai/filter-faceblur`.'
+        required: true
+        type: string
+      version:
+        description: 'Bare release semver, e.g. `0.1.5`.'
+        required: true
+        type: string
+      dry_run:
+        description: Plan only — log planned bump PRs without calling open-mechanical-pr.
+        required: false
+        type: boolean
+        default: true
+      single_consumer:
+        description: 'Restrict to one consumer (e.g. `PlainsightAI/jester-pipelines`). Empty = all.'
+        required: false
+        type: string
+        default: ''
+      auto_merge_override:
+        description: Open PRs but skip auto-merge enablement (leaves PRs open for manual review).
+        required: false
+        type: boolean
+        default: true
 
 # Queue per upstream filter — a faceblur release should not cancel an
 # in-flight frame-dedup cascade, but two faceblur releases firing close
@@ -207,8 +238,15 @@ jobs:
   # Phase 3 — Slack on failure. Block Kit shape matches the first-level
   # cascade (openfilter/.github/workflows/cascade-on-tag.yaml) so the
   # two cascades' failure messages read uniformly in the channel.
+  #
+  # Gate is `failure()` alone (no `filter_name != ''` guard): the
+  # non-`filter-*` no-op exits prepare with status 0 and skips bump via
+  # its own `if:` — `failure()` is already false in that case. Guarding
+  # on filter_name would silently swallow the prepare-exit-1 path
+  # (single-segment docker_image, line ~108) where filter_name is never
+  # written; better to let that surface on Slack.
   notify:
-    if: failure() && needs.prepare.outputs.filter_name != ''
+    if: failure()
     needs: [prepare, bump]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -235,11 +273,11 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "Cascading `${{ needs.prepare.outputs.filter_name }}` `${{ inputs.version }}` to pipeline-manifest consumers failed. A human needs to investigate before the next release, otherwise consumers will not pick up the new image."
+                  text: "Cascading `${{ needs.prepare.outputs.filter_name || inputs.docker_image }}` `${{ inputs.version }}` to pipeline-manifest consumers failed. A human needs to investigate before the next release, otherwise consumers will not pick up the new image."
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "Release: <${{ needs.prepare.outputs.release_url }}|${{ needs.prepare.outputs.filter_name }} ${{ inputs.version }}>"
+                  text: "Release: <${{ needs.prepare.outputs.release_url || format('https://github.com/{0}', github.repository) }}|${{ needs.prepare.outputs.filter_name || inputs.docker_image }} ${{ inputs.version }}>"
               - type: "section"
                 text:
                   type: "mrkdwn"
