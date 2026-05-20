@@ -1,4 +1,4 @@
-# cascade-pipeline-bumps.yaml — On a filter-* image release, open
+# cascade-pipeline-bumps.yaml — On a filter image release, open
 # mechanical bump PRs against every consumer that pins that filter's
 # image. Called as a `workflow_call` from filter-release.yaml (which is
 # itself called by each filter-* repo's release workflow), so this fires
@@ -19,7 +19,7 @@ on:
       docker_image:
         description: |
           Docker image (`<repo>` without tag) of the just-published
-          filter, e.g. `plainsightai/filter-faceblur`. Used to derive
+          filter, e.g. `plainsightai/openfilter-faceblur`. Used to derive
           the filter_name (trailing path component) and the new image
           coordinate (combined with `version`).
         required: true
@@ -76,7 +76,7 @@ on:
   workflow_dispatch:
     inputs:
       docker_image:
-        description: 'Docker image (`<repo>` without tag), e.g. `plainsightai/filter-faceblur`.'
+        description: 'Docker image (`<repo>` without tag), e.g. `plainsightai/openfilter-faceblur`.'
         required: true
         type: string
       version:
@@ -133,7 +133,7 @@ jobs:
           set -euo pipefail
 
           # Filter name = trailing path component of docker_image.
-          # `plainsightai/filter-faceblur` → `filter-faceblur`.
+          # `plainsightai/openfilter-faceblur` → `openfilter-faceblur`.
           # Single-segment (no slash) is rejected — every filter image
           # we publish carries at minimum an org prefix.
           if [[ "${DOCKER_IMAGE}" != */* ]]; then
@@ -142,12 +142,18 @@ jobs:
           fi
           FILTER_NAME="${DOCKER_IMAGE##*/}"
 
-          # Sanity gate — only cascade for filter-* names. Lets the
-          # workflow be wired into filter-release.yaml unconditionally
-          # without misfiring for repos that, e.g., publish a docs
-          # image alongside the filter.
-          if [[ "${FILTER_NAME}" != filter-* ]]; then
-            echo "filter_name='${FILTER_NAME}' is not filter-*-prefixed; cascade is a no-op."
+          # Sanity gate — only cascade for filter image names. Public
+          # (open) filters publish to DockerHub as `openfilter-<name>`;
+          # private/premium filters publish to GAR as `filter-<name>`.
+          # Accept both: this workflow rides the public filter-release.yaml
+          # today (every pin openfilter-pipelines-controller tracks is an
+          # `openfilter-*` coordinate), and matching `filter-*` too keeps
+          # it correct if it is ever wired into the premium release path.
+          # A non-filter image pushed through filter-release.yaml (e.g. a
+          # docs image) falls through here to the no-op rather than
+          # misfiring.
+          if [[ "${FILTER_NAME}" != filter-* && "${FILTER_NAME}" != openfilter-* ]]; then
+            echo "filter_name='${FILTER_NAME}' is not a filter image name (expected openfilter-* or filter-*); cascade is a no-op."
             echo "filter_name=" >> "$GITHUB_OUTPUT"
             echo "new_image_coord=" >> "$GITHUB_OUTPUT"
             echo "release_url=" >> "$GITHUB_OUTPUT"
