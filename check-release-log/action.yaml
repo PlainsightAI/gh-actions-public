@@ -44,7 +44,18 @@ runs:
         SOURCE_PATHS: ${{ inputs.source-paths }}
         IGNORE_PATHS: ${{ inputs.ignore-paths }}
         SUBSTANTIVE_CHANGED: ${{ steps.detect.outputs.any_changed }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       run: |
+        # Dependabot opens PRs that bump dependency manifests but never edits
+        # RELEASE.md, so requiring a changelog entry makes every dependabot PR
+        # unmergeable without manual intervention. Skip the check for PRs
+        # authored by dependabot; the dep bump itself is the changelog signal.
+        if [[ "$PR_AUTHOR" == "dependabot[bot]" ]]; then
+          echo "Dependabot PR detected; skipping release log check."
+          echo "run=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         # NOTE: `any_changed` is a string output from tj-actions/changed-files;
         # the literal 'true' comparison is intentional. Don't refactor to a
         # native boolean test — the output's name suggests boolean semantics
