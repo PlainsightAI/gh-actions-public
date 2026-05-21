@@ -1,0 +1,43 @@
+name: Test Google Cloud Auth Action
+
+on:
+  # For manual testing
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test (development, staging, production)'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+  # Run on every PR
+  pull_request:
+
+jobs:
+  test-auth:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [development, staging, production]
+    permissions:
+      contents: read
+      id-token: write  # Required for workload identity federation
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Test Google Cloud Auth Action
+        uses: ./google-cloud-auth  # Uses the local action
+        with:
+          environment: ${{ github.event.inputs.environment || matrix.environment }}
+
+      # Add a simple test to verify authentication worked
+      - name: Verify Authentication
+        run: |
+          gcloud auth list
+          gcloud projects list
+          echo "Authentication successful for ${{ matrix.environment }} environment!"
