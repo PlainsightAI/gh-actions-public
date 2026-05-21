@@ -84,6 +84,7 @@ If the PR touches none of the listed globs (or, for `ignore-paths`, ONLY files m
 
 | Check                           | Description |
 |----------------------------------|-------------|
+| Dependabot bypass               | PRs authored by `dependabot[bot]` skip the action entirely. Dependency bumps don't (and shouldn't have to) touch `RELEASE.md`; the bump itself is the changelog signal. |
 | Substantive-change gate (optional) | If `source-paths` is set and the PR touches none of them, or if `ignore-paths` is set and the PR changes ONLY files matching those globs, all subsequent checks are skipped and the action passes. Both inputs can be combined; the gate fires when either condition applies. |
 | `RELEASE.md` updated            | Fails the PR if `RELEASE.md` is not modified |
 | Changelog entry parsing         | Uses [`changelog-parser-action`](https://github.com/PlainsightAI/changelog-parser-action) to extract the latest changelog version |
