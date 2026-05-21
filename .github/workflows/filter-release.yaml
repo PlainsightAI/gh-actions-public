@@ -186,6 +186,44 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      # Filter Dockerfiles typically pip-install `<package>==$(cat VERSION)`
+      # from PyPI. On a version-bump PR the new wheel hasn't been published
+      # yet, so the dry-run build can't resolve `<pkg>==<new-version>` and
+      # fails with "Could not find a version that satisfies the requirement".
+      # Swap the workspace VERSION for the base branch's value before the
+      # build — we still exercise the Dockerfile against the latest published
+      # wheel, which is what `dry-run-publish` is meant to catch. The real
+      # publish path (post-merge) uses the bumped VERSION and the freshly
+      # published wheel, so nothing is bypassed there.
+      - name: Use base-branch VERSION for dry-run when VERSION bumped on PR
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -eu
+          if [ ! -f VERSION ]; then
+            echo "No VERSION file; nothing to override."
+            exit 0
+          fi
+          if ! git fetch --depth=1 origin "$BASE_REF"; then
+            echo "::warning::Could not fetch base '${BASE_REF}'; dry-run will build with PR VERSION."
+            exit 0
+          fi
+          BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:VERSION" 2>/dev/null || true)
+          PR_VERSION_RAW=$(cat VERSION 2>/dev/null || true)
+          BASE_VERSION=$(printf '%s' "$BASE_VERSION_RAW" | tr -d ' \t\r\n')
+          PR_VERSION=$(printf '%s' "$PR_VERSION_RAW" | tr -d ' \t\r\n')
+          if [ -z "$BASE_VERSION" ]; then
+            echo "Base branch has no VERSION; dry-run will build with PR VERSION."
+            exit 0
+          fi
+          if [ "$BASE_VERSION" = "$PR_VERSION" ]; then
+            echo "VERSION unchanged on PR; no override."
+            exit 0
+          fi
+          echo "::notice::VERSION bumped on PR (${PR_VERSION}) — overriding workspace VERSION with base (${BASE_VERSION}) for dry-run Docker build so the pip install can resolve against the published wheel. The real publish path uses ${PR_VERSION} after merge."
+          printf '%s\n' "$BASE_VERSION" > VERSION
+        shell: bash
+
       - name: "PreAction Disk-Cleanup"
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
