@@ -1,0 +1,55 @@
+name: 'Publish Docker Image to GAR'
+description: 'Builds and publishes a Docker image to Google Artifact Registry'
+
+inputs:
+  version:
+    description: 'Override the version from the VERSION file'
+    required: false
+    default: ''
+  image:
+    description: 'Override the default IMAGE path'
+    required: false
+    default: ''
+  working-directory:
+    description: 'Working directory to run the build and publish commands'
+    required: false
+    default: '.'
+  environment:
+    description: 'Environment to authenticate to (production, staging, development)'
+    required: false
+    default: 'production'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Override IMAGE (if provided)
+      if: inputs.image != ''
+      shell: bash
+      run: |
+        echo "Overriding IMAGE with: ${{ inputs.image }}"
+        echo "IMAGE=${{ inputs.image }}" >> $GITHUB_ENV
+
+    - name: Authenticate to Google Cloud
+      uses: PlainsightAI/gh-actions-public/google-cloud-auth@main
+      with:
+        environment: ${{ inputs.environment }}
+
+    - name: Configure Docker for GAR
+      shell: bash
+      run: |
+        gcloud auth configure-docker us-west1-docker.pkg.dev
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Build docker image
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        make build-image
+
+    - name: Push docker image
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        make publish-image

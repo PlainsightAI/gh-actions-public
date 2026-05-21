@@ -1,0 +1,60 @@
+name: Deploy Service
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'The name of the service to deploy'
+        required: true
+        type: string
+      manifests-path:
+        description: 'The path to the manifests directory'
+        required: true
+        type: string
+
+jobs:
+  development:
+    runs-on: ubuntu-latest
+    environment: development
+    concurrency:
+      group: deploy-${{ inputs.service-name }}-development
+      cancel-in-progress: false
+    steps:
+      - name: Deploy to Development
+        uses: PlainsightAI/gh-actions-public/deploy-env@main
+        with:
+          environment: development
+          service-name: ${{ inputs.service-name }}
+          manifests-path: ${{ inputs.manifests-path }}
+          gh-bot-user-pat: ${{ secrets.GH_BOT_USER_PAT }}
+
+  staging:
+    runs-on: ubuntu-latest
+    needs: development
+    environment: staging
+    concurrency:
+      group: deploy-${{ inputs.service-name }}-staging
+      cancel-in-progress: false
+    steps:
+      - name: Deploy to Staging
+        uses: PlainsightAI/gh-actions-public/deploy-env@main
+        with:
+          environment: staging
+          service-name: ${{ inputs.service-name }}
+          manifests-path: ${{ inputs.manifests-path }}
+          gh-bot-user-pat: ${{ secrets.GH_BOT_USER_PAT }}
+
+  production:
+    runs-on: ubuntu-latest
+    needs: staging
+    environment: production
+    concurrency:
+      group: deploy-${{ inputs.service-name }}-production
+      cancel-in-progress: false
+    steps:
+      - name: Deploy to Production
+        uses: PlainsightAI/gh-actions-public/deploy-env@main
+        with:
+          environment: production
+          service-name: ${{ inputs.service-name }}
+          manifests-path: ${{ inputs.manifests-path }}
+          gh-bot-user-pat: ${{ secrets.GH_BOT_USER_PAT }}

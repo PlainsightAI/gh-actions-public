@@ -1,0 +1,80 @@
+name: 'Deploy Environment'
+description: 'Deploy an environment'
+
+inputs:
+  service-name:
+    description: 'The name of the service to deploy'
+    required: true
+  environment:
+    description: 'The environment to deploy to'
+    required: true
+  manifests-path:
+    description: 'The path to the manifests directory'
+    required: true
+  gh-bot-user-pat:
+    description: 'GitHub PAT for the bot user'
+    required: true
+
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+        token: ${{ inputs.gh-bot-user-pat }}
+
+    - name: Download image policy
+      uses: dsaltares/fetch-gh-release-asset@1.1.2
+      with:
+        repo: 'PlainsightAI/infrastructure-tooling'
+        version: 'tags/image-policy-applier/v0.1.2'
+        file: 'image-policy-applier'
+        token: ${{ inputs.gh-bot-user-pat }}
+
+    - name: Apply image policy
+      run: |
+        export VERSION=${GITHUB_SHA}
+        chmod +x image-policy-applier
+        ./image-policy-applier --policy-name ${{ inputs.service-name }} --environment ${{ inputs.environment }} --manifests-path ${{ inputs.manifests-path }} --latest-image $(make image-tag)
+      shell: bash
+
+    - name: Commit and push changes
+      run: |
+        git config --global user.name "plainsight-bot"
+        git config --global user.email "cloudinfra@plainsight.ai"
+
+        # No-op guard. Stale re-runs replay the workflow against a frozen trigger
+        # SHA, so image-policy-applier tries to write a tag that main has already
+        # moved past. Without this, those re-runs fail forever on merge conflict
+        # or — if resolved the wrong way — silently roll the env backwards.
+        if git diff --quiet -- "${{ inputs.manifests-path }}"; then
+          echo "image tag already current; nothing to commit"
+          exit 0
+        fi
+
+        git add "${{ inputs.manifests-path }}"
+        git commit -m "Update ${{ inputs.service-name }} version for ${{ inputs.environment }} environment"
+
+        # Concurrent deploys race on the same tag line. Rebase (not merge) to keep
+        # history linear, and retry if another deploy lands between fetch and push.
+        # -X theirs resolves any tag-line conflict by keeping our bump — our commit
+        # represents the image we want running, and last push wins.
+        #
+        # --deepen=50 on each fetch guards against the checkout's fetch-depth: 2
+        # shallow clone: if main advances past what we have, rebase can't find the
+        # merge base. --deepen is a no-op on complete repos.
+        for attempt in 1 2 3 4 5; do
+          if git fetch --deepen=50 origin main \
+             && git rebase -X theirs origin/main \
+             && git push origin main; then
+            exit 0
+          fi
+          git rebase --abort 2>/dev/null || true
+          sleep $((attempt * 2))
+        done
+
+        echo "failed to push deploy commit after 5 rebase attempts" >&2
+        exit 1
+      shell: bash
