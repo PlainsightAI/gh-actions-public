@@ -1,0 +1,50 @@
+name: 'Google Cloud Workload Identity'
+description: 'Authenticates to Google Cloud using Workload Identity Federation based on environment'
+
+inputs:
+  environment:
+    description: 'Environment to authenticate to (development, staging, production)'
+    required: true
+    default: 'production'
+  google_cloud_sdk_components:
+    description: 'Google Cloud SDK components to install, if needed'
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set outputs
+      id: set-outputs
+      shell: bash
+      run: |
+        # Validate environment input
+        if [[ "${{ inputs.environment }}" != "production" && "${{ inputs.environment }}" != "staging" && "${{ inputs.environment }}" != "development" ]]; then
+          echo "::error::Invalid environment value: ${{ inputs.environment }}. Must be one of: development, staging, production"
+          exit 1
+        fi
+
+        case "${{ inputs.environment }}" in
+          production)
+            echo "wi_provider=projects/676115004559/locations/global/workloadIdentityPools/gh-actions-pool/providers/gh-actions-provider" >> "$GITHUB_OUTPUT"
+            echo "service_account=gh-actions-svc-account@plainsightai-prod.iam.gserviceaccount.com" >> "$GITHUB_OUTPUT"
+            ;;
+          staging)
+            echo "wi_provider=projects/8406620562/locations/global/workloadIdentityPools/gh-actions-pool/providers/gh-actions-provider" >> "$GITHUB_OUTPUT"
+            echo "service_account=gh-actions-svc-account@plainsightai-staging.iam.gserviceaccount.com" >> "$GITHUB_OUTPUT"
+            ;;
+          development)
+            echo "wi_provider=projects/934113377363/locations/global/workloadIdentityPools/gh-actions-pool/providers/gh-actions-provider" >> "$GITHUB_OUTPUT"
+            echo "service_account=gh-actions-svc-account@plainsightai-dev.iam.gserviceaccount.com" >> "$GITHUB_OUTPUT"
+            ;;
+        esac
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ steps.set-outputs.outputs.wi_provider }}
+        service_account: ${{ steps.set-outputs.outputs.service_account }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v3
+      with:
+        install_components: ${{ inputs.google_cloud_sdk_components }}
