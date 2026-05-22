@@ -36,6 +36,8 @@ image-tag:
 	@echo "$(IMAGE):$(VERSION)"
 ```
 
+> ⚠️ **Note on Makefile variables:** Ensure that `VERSION` is defined using lazy assignment (e.g. `VERSION ?= ...` or overridable with env vars) rather than immediate assignment (e.g. `VERSION := ...`). The deployment action sets `VERSION=${GITHUB_SHA}` in the environment, which must be allowed to override the Makefile's default value so the correct build-specific tag is outputted.
+
 ### 2. PAT Write Scope (`gh-bot-user-pat`)
 
 Because GitHub Actions' default `GITHUB_TOKEN` may not trigger downstream workflows or might have restricted permissions, this action requires a Personal Access Token (PAT) passed via `gh-bot-user-pat`.

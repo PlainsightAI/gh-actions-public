@@ -36,6 +36,7 @@ runs:
         echo "Overriding IMAGE with: ${{ inputs.image }}"
         echo "IMAGE=${{ inputs.image }}" >> $GITHUB_ENV
 
+    # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
     - name: Authenticate to Google Cloud
       uses: PlainsightAI/gh-actions-public/google-cloud-auth@main
       with:
