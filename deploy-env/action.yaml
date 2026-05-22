@@ -20,6 +20,10 @@ runs:
   using: "composite"
   steps:
     - name: Checkout Repository
+      # A fetch-depth of 2 is used to optimize checkout time and minimize network
+      # overhead in larger repositories. This shallow clone provides enough git history
+      # (exactly 2 commits) to compare files and make incremental commits without
+      # downloading the entire repository history.
       uses: actions/checkout@v4
       with:
         fetch-depth: 2
@@ -42,8 +46,8 @@ runs:
 
     - name: Commit and push changes
       run: |
-        git config --global user.name "plainsight-bot"
-        git config --global user.email "cloudinfra@plainsight.ai"
+        git config user.name "plainsight-bot"
+        git config user.email "cloudinfra@plainsight.ai"
 
         # No-op guard. Stale re-runs replay the workflow against a frozen trigger
         # SHA, so image-policy-applier tries to write a tag that main has already
@@ -72,7 +76,7 @@ runs:
             exit 0
           fi
           git rebase --abort 2>/dev/null || true
-          sleep $((attempt * 2))
+          sleep $(( (RANDOM % 3) + attempt * 2 ))
         done
 
         echo "failed to push deploy commit after 5 rebase attempts" >&2

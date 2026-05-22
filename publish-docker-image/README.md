@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Publish Docker Image to GAR
-        uses: PlainsightAI/gh-actions/publish-docker-image@main
+        uses: PlainsightAI/gh-actions-public/publish-docker-image@main
         with:
           version: "v1.2.3"
           environment: "production"
@@ -50,7 +50,7 @@ jobs:
 
 ```yaml
       - name: Publish custom image
-        uses: PlainsightAI/gh-actions/publish-docker-image@main
+        uses: PlainsightAI/gh-actions-public/publish-docker-image@main
         with:
           image: us-west1-docker.pkg.dev/my-project/custom/image-name
           version: "v1.2.3"

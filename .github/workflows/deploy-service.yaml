@@ -10,6 +10,10 @@ on:
         description: 'The path to the manifests directory'
         required: true
         type: string
+    secrets:
+      GH_BOT_USER_PAT:
+        description: 'GitHub PAT for the bot user with repository write access'
+        required: true
 
 jobs:
   development:
@@ -19,6 +23,7 @@ jobs:
       group: deploy-${{ inputs.service-name }}-development
       cancel-in-progress: false
     steps:
+      # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
       - name: Deploy to Development
         uses: PlainsightAI/gh-actions-public/deploy-env@main
         with:
@@ -35,6 +40,7 @@ jobs:
       group: deploy-${{ inputs.service-name }}-staging
       cancel-in-progress: false
     steps:
+      # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
       - name: Deploy to Staging
         uses: PlainsightAI/gh-actions-public/deploy-env@main
         with:
@@ -51,6 +57,7 @@ jobs:
       group: deploy-${{ inputs.service-name }}-production
       cancel-in-progress: false
     steps:
+      # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
       - name: Deploy to Production
         uses: PlainsightAI/gh-actions-public/deploy-env@main
         with:
