@@ -105,19 +105,29 @@ runs:
       if: steps.should_run.outputs.run == 'true'
       id: version_check
       run: |
+        VERSION_SOURCE=""
         if [[ -f "VERSION" ]]; then
-          VERSION_FILE=$(cat VERSION | tr -d '[:space:]')
-          echo "VERSION file: $VERSION_FILE"
+          VERSION_FILE=$(tr -d '[:space:]' < VERSION)
+          VERSION_SOURCE="VERSION"
+        elif [[ -f "pyproject.toml" ]]; then
+          # Fallback to [project].version in pyproject.toml when no VERSION file
+          # is present. tomllib is stdlib on ubuntu-latest's python3 (>=3.11).
+          VERSION_FILE=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null | tr -d '[:space:]' || true)
+          [[ -n "$VERSION_FILE" ]] && VERSION_SOURCE="pyproject.toml"
+        fi
+
+        if [[ -n "$VERSION_SOURCE" ]]; then
+          echo "${VERSION_SOURCE} version: $VERSION_FILE"
           echo "Changelog version: $CHANGELOG_VERSION"
 
           if [[ "$VERSION_FILE" != "$CHANGELOG_VERSION" ]]; then
-            echo "❌ VERSION mismatch! VERSION file: $VERSION_FILE, RELEASE.md: $CHANGELOG_VERSION"
+            echo "❌ VERSION mismatch! ${VERSION_SOURCE}: $VERSION_FILE, RELEASE.md: $CHANGELOG_VERSION"
             exit 1
           else
             echo "✅ VERSION matches!"
           fi
         else
-          echo "No VERSION file found, skipping version check."
+          echo "No VERSION file or pyproject.toml [project].version found, skipping version check."
         fi
       shell: bash
 
@@ -138,11 +148,23 @@ runs:
         # Actions composite step default), a non-zero exit from git-show
         # kills the pipeline before the ${VAR:-0.0.0} fallback can fire.
         # Capture first, transform second.
+        # Pull version from VERSION; fall back to pyproject.toml [project].version
+        # when no VERSION file exists (on either ref).
+        parse_pyproject() {
+          python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])' 2>/dev/null || true
+        }
+
         BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:VERSION" 2>/dev/null || true)
+        if [[ -z "$BASE_VERSION_RAW" ]]; then
+          BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:pyproject.toml" 2>/dev/null | parse_pyproject || true)
+        fi
         BASE_VERSION=$(printf '%s' "$BASE_VERSION_RAW" | tr -d '[:space:]v')
         BASE_VERSION="${BASE_VERSION:-0.0.0}"
 
         PR_VERSION_RAW=$(cat VERSION 2>/dev/null || true)
+        if [[ -z "$PR_VERSION_RAW" && -f pyproject.toml ]]; then
+          PR_VERSION_RAW=$(parse_pyproject < pyproject.toml || true)
+        fi
         PR_VERSION=$(printf '%s' "$PR_VERSION_RAW" | tr -d '[:space:]v')
         PR_VERSION="${PR_VERSION:-0.0.0}"
 

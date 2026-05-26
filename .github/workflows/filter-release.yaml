@@ -200,28 +200,55 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -eu
-          if [ ! -f VERSION ]; then
-            echo "No VERSION file; nothing to override."
+          # Source the version from VERSION or fall back to pyproject.toml's
+          # [project].version. The override only rewrites the file we sourced
+          # from, so Dockerfiles that `cat VERSION` and those that pip-install
+          # from a pyproject-pinned package both see the base-branch value.
+          parse_pyproject() {
+            python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])' 2>/dev/null || true
+          }
+
+          VERSION_FILE=""
+          if [ -f VERSION ]; then
+            VERSION_FILE=VERSION
+          elif [ -f pyproject.toml ]; then
+            VERSION_FILE=pyproject.toml
+          else
+            echo "No VERSION file or pyproject.toml; nothing to override."
             exit 0
           fi
           if ! git fetch --depth=1 origin "$BASE_REF"; then
             echo "::warning::Could not fetch base '${BASE_REF}'; dry-run will build with PR VERSION."
             exit 0
           fi
-          BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:VERSION" 2>/dev/null || true)
-          PR_VERSION_RAW=$(cat VERSION 2>/dev/null || true)
+
+          if [ "$VERSION_FILE" = VERSION ]; then
+            BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:VERSION" 2>/dev/null || true)
+            PR_VERSION_RAW=$(cat VERSION 2>/dev/null || true)
+          else
+            BASE_VERSION_RAW=$(git show "origin/${BASE_REF}:pyproject.toml" 2>/dev/null | parse_pyproject || true)
+            PR_VERSION_RAW=$(parse_pyproject < pyproject.toml || true)
+          fi
           BASE_VERSION=$(printf '%s' "$BASE_VERSION_RAW" | tr -d ' \t\r\n')
           PR_VERSION=$(printf '%s' "$PR_VERSION_RAW" | tr -d ' \t\r\n')
           if [ -z "$BASE_VERSION" ]; then
-            echo "Base branch has no VERSION; dry-run will build with PR VERSION."
+            echo "Base branch has no version; dry-run will build with PR VERSION."
             exit 0
           fi
           if [ "$BASE_VERSION" = "$PR_VERSION" ]; then
             echo "VERSION unchanged on PR; no override."
             exit 0
           fi
-          echo "::notice::VERSION bumped on PR (${PR_VERSION}) — overriding workspace VERSION with base (${BASE_VERSION}) for dry-run Docker build so the pip install can resolve against the published wheel. The real publish path uses ${PR_VERSION} after merge."
-          printf '%s\n' "$BASE_VERSION" > VERSION
+          echo "::notice::Version bumped on PR (${PR_VERSION}) — overriding workspace ${VERSION_FILE} with base (${BASE_VERSION}) for dry-run Docker build so the pip install can resolve against the published wheel. The real publish path uses ${PR_VERSION} after merge."
+          if [ "$VERSION_FILE" = VERSION ]; then
+            printf '%s\n' "$BASE_VERSION" > VERSION
+          else
+            # Use tomlkit (TOML grammar, formatting-preserving) so we only touch
+            # [project].version and don't risk clobbering similarly-named keys
+            # under other tables (e.g. tool.poetry.dependencies.*.version).
+            python3 -m pip install --quiet --disable-pip-version-check tomlkit
+            BASE_VERSION="$BASE_VERSION" python3 -c "import os, tomlkit; p='pyproject.toml'; doc=tomlkit.parse(open(p, encoding='utf-8').read()); doc['project']['version']=os.environ['BASE_VERSION']; open(p, 'w', encoding='utf-8').write(tomlkit.dumps(doc))"
+          fi
         shell: bash
 
       - name: "PreAction Disk-Cleanup"
@@ -305,14 +332,22 @@ jobs:
       - name: Check VERSION file (if exists)
         shell: bash
         run: |
+          version_source=""
           if [[ -f "VERSION" ]]; then
             version_file="$(tr -d '[:space:]' < VERSION)"
+            version_source="VERSION"
+          elif [[ -f "pyproject.toml" ]]; then
+            # Fallback: read [project].version from pyproject.toml.
+            version_file="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null | tr -d '[:space:]' || true)"
+            [[ -n "$version_file" ]] && version_source="pyproject.toml"
+          fi
+          if [[ -n "$version_source" ]]; then
             if [[ "$version_file" != "$CHANGELOG_VERSION" ]]; then
-              echo "VERSION mismatch! VERSION file: $version_file, RELEASE.md: $CHANGELOG_VERSION"
+              echo "VERSION mismatch! ${version_source}: $version_file, RELEASE.md: $CHANGELOG_VERSION"
               exit 1
             fi
           else
-            echo "No VERSION file found, skipping version check."
+            echo "No VERSION file or pyproject.toml [project].version found, skipping version check."
           fi
 
       - name: Check if release tag exists
