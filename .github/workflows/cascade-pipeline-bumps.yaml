@@ -4,11 +4,14 @@
 # itself called by each filter-* repo's release workflow), so this fires
 # once per filter-* release publish — no per-repo workflow file needed.
 #
-# Surface enumerated in docs/cascade/consumer-surface.md. Matrix is
-# hardcoded here rather than discovered at runtime: the consumer set is
-# small and stable, and runtime discovery would require an org-scoped
-# token + a marker-file scan per release. When the set changes, add a
-# row to the matrix below.
+# The consumer set is hardcoded in the bump matrix below. Today it is a
+# single repo (openfilter-pipelines-controller); the matrix shape is kept
+# so adding a future consumer is a one-line diff. A resolve-check guards
+# each entry (see the bump job) so a typo'd or deleted repo fails loud in
+# its own shard instead of 404'ing on clone and paging a human — the
+# failure mode that shipped `eval-demo-pipelines` in #19. The pin shapes
+# each consumer uses are documented in docs/cascade/consumer-surface.md;
+# the content-driven bump-strategy.sh adapts to whatever pins it finds.
 #
 # PLAT-1052: https://plainsight-ai.atlassian.net/browse/PLAT-1052
 name: Cascade pipeline bumps
@@ -30,10 +33,10 @@ on:
         type: string
       dry_run:
         description: |
-          Plan only — run discovery and the bump strategy, log which
-          consumers would receive a PR, but do not call
-          open-mechanical-pr. Surfaced only via workflow_dispatch on
-          the caller; the release-driven path is always live.
+          Plan only — run the bump strategy and log which consumers
+          would receive a PR, but do not call open-mechanical-pr.
+          Surfaced only via workflow_dispatch on the caller; the
+          release-driven path is always live.
         required: false
         type: boolean
         default: false
@@ -58,14 +61,17 @@ on:
         description: |
           plainsight-bot PAT. Must have read access to every consumer
           repo (for clone) and write access (for push, PR creation,
-          auto-merge enablement) via open-mechanical-pr.
+          auto-merge enablement) via open-mechanical-pr. Also used by the
+          notify job to claim the cross-repo fleet-dedup lock (a ref in
+          gh-actions-public), so it needs contents:write there too.
         required: true
       SLACK_WEBHOOK_URL:
         description: |
           Incoming-webhook URL for the failure-notification Slack
-          channel. Optional — when unset, the notify job no-ops with
-          a warning so failures surface only in the Actions run
-          summary.
+          channel. Optional — when unset, the notify job skips the post
+          and emits a warning. Scoped to private/internal repos, so the
+          alert resolves only when this cascade runs in a private filter
+          repo context (the live release path), not in public callers.
         required: false
   # Manual entry point for smoke-testing the cascade without cutting a
   # real filter release. Inputs mirror workflow_call; defaults bias
@@ -108,11 +114,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Phase 1 — derive cascade inputs + filter the consumer matrix.
-  # Hardcoded matrix lives in the bump job below; this job's role is to
-  # extract filter_name from docker_image, build new_image_coord, and
-  # decide whether to skip the cascade entirely (single_consumer set to
-  # a value not in the matrix → no shards → no PRs).
+  # Phase 1 — derive cascade inputs. Extracts filter_name from
+  # docker_image, builds new_image_coord, and decides whether to skip the
+  # cascade entirely (a non-filter image → empty filter_name → no shards).
+  # single_consumer filtering happens per-shard in `bump`.
   prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -170,10 +175,10 @@ jobs:
           echo "new_image_coord=${NEW_IMAGE_COORD}" >> "$GITHUB_OUTPUT"
           echo "release_url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
 
-  # Phase 2 — per-consumer bump. One matrix shard per pin-bearing repo.
-  # See docs/cascade/consumer-surface.md for why these three are the
-  # full PR-walkable surface; runtime discovery is intentionally not
-  # used here (rationale at top of this file).
+  # Phase 2 — per-consumer bump. One matrix shard per consumer repo.
+  # See docs/cascade/consumer-surface.md for the pin shapes each consumer
+  # uses; the content-driven bump-strategy.sh adapts to whatever it finds.
+  # To add a consumer, append a row below.
   bump:
     if: needs.prepare.outputs.filter_name != ''
     needs: [prepare]
@@ -186,9 +191,7 @@ jobs:
       max-parallel: 6
       matrix:
         consumer:
-          - PlainsightAI/jester-pipelines
           - PlainsightAI/openfilter-pipelines-controller
-          - PlainsightAI/eval-demo-pipelines
     steps:
       - name: Skip if outside single_consumer scope
         id: scope
@@ -202,6 +205,22 @@ jobs:
             echo "in_scope=false" >> "$GITHUB_OUTPUT"
           else
             echo "in_scope=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail loud if the matrix names a repo that doesn't resolve (typo
+      # or deletion) instead of letting it 404 on clone and page a human.
+      # This is the cheap guard that the hardcoded `eval-demo-pipelines`
+      # row lacked in #19.
+      - name: Verify consumer resolves
+        if: steps.scope.outputs.in_scope == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
+          CONSUMER: ${{ matrix.consumer }}
+        run: |
+          set -euo pipefail
+          if ! gh repo view "${CONSUMER}" --json name >/dev/null 2>&1; then
+            echo "::error::Consumer '${CONSUMER}' does not resolve — fix or remove it from the bump matrix in cascade-pipeline-bumps.yaml." >&2
+            exit 1
           fi
 
       - name: Prepare bump
@@ -241,31 +260,76 @@ jobs:
           gh_token: ${{ secrets.GH_BOT_USER_PAT }}
           auto_merge: ${{ inputs.auto_merge_override && 'false' || 'true' }}
 
-  # Phase 3 — Slack on failure. Block Kit shape matches the first-level
-  # cascade (openfilter/.github/workflows/cascade-on-tag.yaml) so the
-  # two cascades' failure messages read uniformly in the channel.
+  # Phase 3 — Slack on failure, deduplicated across the fleet.
   #
-  # Gate is `failure()` alone (no `filter_name != ''` guard): the
-  # non-`filter-*` no-op exits prepare with status 0 and skips bump via
-  # its own `if:` — `failure()` is already false in that case. Guarding
-  # on filter_name would silently swallow the prepare-exit-1 path
-  # (single-segment docker_image, line ~108) where filter_name is never
-  # written; better to let that surface on Slack.
+  # This second-level cascade is invoked once per filter release, so a
+  # production openfilter wave (~N filters) fires N independent runs in N
+  # filter-repo Actions contexts. Concurrency groups are per-repo, so they
+  # cannot coalesce — a naive per-run notify would multiply into N
+  # near-identical alerts (the symptom that the eval-demo phantom made
+  # impossible to miss: 8 filters × 1 phantom shard = 8 pages per release).
+  #
+  # Dedup via a cross-repo claim lock. The identity of a fleet-duplicated
+  # failure is (consumer, failure_class, UTC hour) — the filter name and
+  # version are deliberately excluded because they are the dimension we
+  # are collapsing. We hash that identity and try to atomically create a
+  # ref `refs/notify-claims/<hour>/<hash>` in gh-actions-public; git ref
+  # creation is a compare-and-swap (201 on create, 422 if it exists), so
+  # exactly one run in the wave wins the claim and posts. The hour is in
+  # the ref *name* so gc-notify-claims.yaml can age stale locks out.
+  #
+  # Fail-open: if the claim API errors AND the ref does not already exist,
+  # we post anyway — a duplicate alert is cheaper than a missed one.
   notify:
     if: failure()
     needs: [prepare, bump]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
-    # `secrets.X != ''` works in step `if:` for workflow_call workflows;
-    # `env.X` would not (step-level env is not yet bound at if-eval time).
-    # Done via an explicit env-export step rather than two probe-and-act
-    # steps so the boolean lives in one place.
     env:
       HAS_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL != '' && 'true' || 'false' }}
+      GH_TOKEN: ${{ secrets.GH_BOT_USER_PAT }}
+      # Lock store: any repo the bot can write refs to. Refs hold no
+      # secret material and live in a hidden namespace, so the public
+      # gh-actions-public is fine and keeps the lock next to the workflow.
+      OPS_REPO: PlainsightAI/gh-actions-public
+      OPS_BRANCH: main
+      # Single live consumer today; if the matrix grows, fold the failed
+      # consumer(s) into the hash so distinct consumers alert separately.
+      CONSUMER: PlainsightAI/openfilter-pipelines-controller
+      PREPARE_RESULT: ${{ needs.prepare.result }}
     steps:
-      - name: Slack on failure
+      - name: Claim fleet-dedup lock
+        id: claim
         if: env.HAS_WEBHOOK == 'true'
+        run: |
+          set -uo pipefail
+          # Coarse failure class, cheaply available from job results:
+          # a prepare failure (bad input/derive) is a different identity
+          # from a bump failure (clone/strategy/PR against the consumer).
+          FAILURE_CLASS="bump"
+          [ "${PREPARE_RESULT}" = "failure" ] && FAILURE_CLASS="prepare"
+
+          BUCKET="$(date -u +%Y%m%d%H)"
+          HASH="$(printf '%s|%s' "${CONSUMER}" "${FAILURE_CLASS}" | sha256sum | cut -c1-32)"
+          REF_SHORT="notify-claims/${BUCKET}/${HASH}"
+
+          SHA="$(gh api "repos/${OPS_REPO}/git/ref/heads/${OPS_BRANCH}" --jq '.object.sha')"
+
+          post=true
+          if gh api -X POST "repos/${OPS_REPO}/git/refs" \
+               -f ref="refs/${REF_SHORT}" -f sha="${SHA}" >/dev/null 2>&1; then
+            echo "Won claim ${REF_SHORT}; posting."
+          elif gh api "repos/${OPS_REPO}/git/ref/${REF_SHORT}" >/dev/null 2>&1; then
+            post=false
+            echo "Claim ${REF_SHORT} already held by a sibling run; skipping duplicate Slack."
+          else
+            echo "::warning::Claim API failed and ref absent; failing open and posting to avoid a missed alert."
+          fi
+          echo "post=${post}" >> "$GITHUB_OUTPUT"
+
+      - name: Slack on failure
+        if: env.HAS_WEBHOOK == 'true' && steps.claim.outputs.post == 'true'
         uses: slackapi/slack-github-action@v2.1.1
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -279,7 +343,7 @@ jobs:
               - type: "section"
                 text:
                   type: "mrkdwn"
-                  text: "Cascading `${{ needs.prepare.outputs.filter_name || inputs.docker_image }}` `${{ inputs.version }}` to pipeline-manifest consumers failed. A human needs to investigate before the next release, otherwise consumers will not pick up the new image."
+                  text: "Cascading `${{ needs.prepare.outputs.filter_name || inputs.docker_image }}` `${{ inputs.version }}` to filter-pin consumers failed. A human needs to investigate before the next release, otherwise consumers will not pick up the new image. _Deduplicated across the release wave — other filters may have hit the same failure._"
               - type: "section"
                 text:
                   type: "mrkdwn"

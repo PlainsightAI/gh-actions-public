@@ -1,0 +1,52 @@
+# gc-notify-claims.yaml — Garbage-collect the cross-repo fleet-dedup
+# locks created by cascade-pipeline-bumps.yaml's notify job.
+#
+# Those locks are refs of the form `refs/notify-claims/<YYYYMMDDHH>/<hash>`,
+# one per (consumer, failure_class, UTC hour) that fired a deduplicated
+# Slack alert. The hour bucket lives in the ref name so this job can age
+# them out by parsing it — refs carry no timestamp of their own. We keep a
+# couple hours of history (cheap, useful for debugging a noisy wave) and
+# delete anything older. Without this, claim refs accumulate unbounded.
+name: GC notify-claim locks
+
+on:
+  schedule:
+    - cron: '17 * * * *' # hourly, offset off the hour
+  workflow_dispatch:
+
+permissions:
+  contents: write # delete refs in this repo
+
+concurrency:
+  group: gc-notify-claims
+  cancel-in-progress: false
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Delete stale claim refs
+        run: |
+          set -euo pipefail
+          # Buckets older than this (UTC YYYYMMDDHH) are deleted. 2h grace
+          # keeps the current and previous hour's locks live so a wave that
+          # straddles an hour boundary still dedups.
+          CUTOFF="$(date -u -d '2 hours ago' +%Y%m%d%H)"
+
+          # matching-refs returns [] (not 404) when the namespace is empty.
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/notify-claims/" \
+            --jq '.[].ref' | while read -r ref; do
+            # ref = refs/notify-claims/<bucket>/<hash>
+            bucket="$(printf '%s' "$ref" | cut -d/ -f3)"
+            case "$bucket" in
+              ''|*[!0-9]*) echo "skip non-numeric bucket in $ref"; continue ;;
+            esac
+            if [ "$bucket" -lt "$CUTOFF" ]; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/${ref#refs/}" \
+                && echo "deleted $ref"
+            fi
+          done
