@@ -46,7 +46,10 @@ jobs:
               ''|*[!0-9]*) echo "skip non-numeric bucket in $ref"; continue ;;
             esac
             if [ "$bucket" -lt "$CUTOFF" ]; then
-              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/${ref#refs/}" \
-                && echo "deleted $ref"
+              if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/${ref#refs/}"; then
+                echo "deleted $ref"
+              else
+                echo "::warning::failed to delete $ref"
+              fi
             fi
           done

@@ -304,6 +304,22 @@ jobs:
         if: env.HAS_WEBHOOK == 'true'
         run: |
           set -uo pipefail
+          # Guard: the dedup identity hardcodes CONSUMER to the single live
+          # repo. If the bump matrix ever grows a second consumer without the
+          # hash being updated to fold it in, a failure from the new consumer
+          # would claim under this key and be silently suppressed. Read the
+          # matrix straight from the running workflow definition (the single
+          # source of truth) and, if it names more than one consumer, fail
+          # open: skip dedup and post unconditionally, flagging the drift loud.
+          WF_B64="$(gh api "repos/${OPS_REPO}/contents/.github/workflows/cascade-pipeline-bumps.yaml?ref=${OPS_BRANCH}" --jq '.content' 2>/dev/null | tr -d '\n')"
+          CONSUMER_COUNT="$(printf '%s' "${WF_B64}" | base64 -d 2>/dev/null \
+            | awk '/^        consumer:/{f=1; next} f && /^          - /{n++; next} f && !/^[[:space:]]*$/{f=0} END{print n+0}')"
+          if [ "${CONSUMER_COUNT}" != "1" ]; then
+            echo "::error::bump matrix has ${CONSUMER_COUNT} consumers but the notify dedup identity hardcodes a single CONSUMER (${CONSUMER}); fold the failed consumer into the hash. Posting without dedup to avoid suppressing a distinct consumer's failure."
+            echo "post=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Coarse failure class, cheaply available from job results:
           # a prepare failure (bad input/derive) is a different identity
           # from a bump failure (clone/strategy/PR against the consumer).
