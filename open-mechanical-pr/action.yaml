@@ -190,7 +190,11 @@ runs:
         # pushing this branch in the next command anyway.
         git checkout -B "$BRANCH_NAME"
         git add -A
-        git commit -m "$COMMIT_MESSAGE"
+        # -s appends a Signed-off-by trailer using the user.name/user.email
+        # configured by the caller (see action inputs above). Required so
+        # the resulting PR passes the DCO probot check on repos where it
+        # is installed; harmless on repos where it is not.
+        git commit -s -m "$COMMIT_MESSAGE"
 
         # Push using the token in the URL — avoids mutating global git
         # config (which `gh auth setup-git` would do persistently on
