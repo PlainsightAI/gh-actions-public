@@ -117,8 +117,8 @@ on:
         description: |
           Optional Slack incoming-webhook URL — passed through to the
           cascade-pipeline-bumps reusable workflow (PLAT-1052) for the
-          failure notification job. Missing → cascade failures surface
-          only in the Actions run summary.
+          fleet-deduplicated failure notification. Missing → cascade
+          failures surface only in the Actions run summary.
         required: false
 
 permissions:
@@ -558,11 +558,11 @@ jobs:
           echo "should_cascade=true" >> "$GITHUB_OUTPUT"
 
   # Second-level cascade: bump filter image pins in every consumer that
-  # tracks this filter (jester-pipelines, openfilter-pipelines-controller,
-  # eval-demo-pipelines). Mirrors the first-level cascade's contract
-  # (matrix fan-out, fail-fast: false, Slack-on-failure). See
-  # docs/cascade/consumer-surface.md for the enumerated consumer set.
-  # PLAT-1052.
+  # tracks this filter (currently openfilter-pipelines-controller; the
+  # consumer set is the bump matrix in cascade-pipeline-bumps.yaml).
+  # Mirrors the first-level cascade's contract (matrix fan-out,
+  # fail-fast: false, Slack-on-failure). See docs/cascade/consumer-surface.md
+  # for each consumer's pin shapes. PLAT-1052.
   cascade-pipeline-bumps:
     needs: [prepare-pypi-publish, cascade-gate]
     if: needs.cascade-gate.outputs.should_cascade == 'true'

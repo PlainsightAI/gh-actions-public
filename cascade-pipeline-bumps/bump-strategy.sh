@@ -55,8 +55,8 @@ for f in "${FILES[@]}"; do
       #
       # First char is restricted to alphanumeric (not `-` or `.`) so we
       # do not chew into the `:-` of a `${VAR:-default}` envelope and
-      # rewrite the `:-` into a stray `:`. Smoke-tested against
-      # eval-demo-pipelines/scripts/docker-compose.sam3.yaml.
+      # rewrite the `:-` into a stray `:` (relevant to any consumer using
+      # the `image: ${VAR:-<registry>/<name>:<tag>}` override shape).
       coord_re = "[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?/" filter_name ":[A-Za-z0-9._-]+"
       # The outer line match also requires the line to be an `image:`
       # key (with optional opener: quote or ${VAR:-) so we never touch

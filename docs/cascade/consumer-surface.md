@@ -1,20 +1,22 @@
-# Filter-release → pipeline-manifest cascade — consumer surface
+# Filter-release → consumer cascade — consumer surface
 
 **Ticket:** [PLAT-1052](https://plainsight-ai.atlassian.net/browse/PLAT-1052) — Phase 1 deliverable.
 
-This document enumerates the PR-walkable surfaces where filter image tags are pinned in production-bearing or production-adjacent repos. It is the input to the Phase 2 second-level cascade workflow: each row becomes (or feeds) one matrix shard, with its `(repo, path glob, pin pattern, bump strategy)` fully specified so the workflow does not have to discover them at runtime.
+This document records the PR-walkable surfaces where filter image tags are pinned in production-bearing or production-adjacent repos, documenting each consumer's `(path glob, pin pattern, bump strategy)`. After Phase 1 investigation the live cascade surface is a single repo — `openfilter-pipelines-controller` — so the cascade hardcodes a one-entry matrix in `cascade-pipeline-bumps.yaml` rather than discovering consumers at runtime; a per-shard resolve-check guards against a typo'd or deleted repo. The rest of this doc is the audit trail of the candidates that were considered and why each was kept, dropped, or scoped out. The pin shapes below are what the content-driven `bump-strategy.sh` must handle.
 
 ## TL;DR
 
 | # | Repo | Path glob | Pin form | Bump strategy | In scope? |
 |---|---|---|---|---|---|
-| 1 | `PlainsightAI/jester-pipelines` | `deploy/**/base/deployment.yaml`, `deploy/**/overlays/*/patch.yaml` | `image: us-west1-docker.pkg.dev/plainsightai-prod/oci/<filter>:<tag>` (GAR) | YAML in-place rewrite of `<tag>`, scoped to images whose repo basename matches the released filter | **Yes** |
-| 2 | `PlainsightAI/openfilter-pipelines-controller` | `demo/pipeline_*.yaml`, `config/samples/pipelines_*.yaml` | `image: plainsightai/openfilter-<name>:v<ver>` (DockerHub) and `ghcr.io/plainsightai/openfilter-<name>:latest` | YAML in-place rewrite of `<ver>` on DockerHub-pinned entries only; `:latest` entries skipped (intent is "track tip") | **Yes** (low-business-value but covers contract) |
-| 3 | `PlainsightAI/eval-demo-pipelines` | `filters/*/docker-compose*.yaml`, `scripts/docker-compose.*.yaml` | mixed: bare image literal **and** `${VAR:-<default>}` env override with default | YAML/regex rewrite of the *default* in the `${VAR:-…}` form; bare literal rewritten directly | **Yes** |
+| 1 | `PlainsightAI/openfilter-pipelines-controller` | `demo/pipeline_*.yaml`, `config/samples/pipelines_*.yaml` | `image: plainsightai/openfilter-<name>:v<ver>` (DockerHub) and `ghcr.io/plainsightai/openfilter-<name>:latest` | YAML in-place rewrite of `<ver>` on DockerHub-pinned entries only; `:latest` entries skipped (intent is "track tip") | **Yes** — the one live consumer |
+| 2 | `PlainsightAI/jester-pipelines` | `deploy/**/base/deployment.yaml`, `deploy/**/overlays/*/patch.yaml` | `image: us-west1-docker.pkg.dev/plainsightai-prod/oci/<filter>:<tag>` (GAR) | YAML in-place rewrite of `<tag>` | **No** — dropped (see Section 1): effectively dormant (last real push 2026-01), and its GAR pins depend on an unconfirmed mirror sync (Open question 1) |
+| 3 | `PlainsightAI/eval-demo-pipelines` | n/a — **does not exist** | n/a | n/a | **No** — this repo never existed (org audit log shows no create/rename/destroy footprint); the row was authored in error and removed (see Section 3) |
 | 4 | `PlainsightAI/openfilter-hub` | n/a — **investigated and rejected** | filter metadata fetched from `https://api.prod.plainsight.tech` at build time; no image tags pinned in the repo | n/a | **No** — listed in ticket as a candidate; confirmed not a cascade target |
 | 5 | `plainsight-api` DB-stored PipelineInstance specs | n/a — **out of scope** | hardcoded image tags in DB rows authored by users | n/a | **No** — ticket explicitly scopes this out; follow-up needed |
 
-## Section 1 — `jester-pipelines`
+## Section 1 — `jester-pipelines` (dropped from the live cascade)
+
+**Not currently a cascade target.** `jester-pipelines` is effectively dormant (last real push 2026-01) and its pins are GAR-registry coordinates whose bump only does something useful if a DockerHub→GAR mirror sync exists on release — unconfirmed (Open question 1). Rather than carry a consumer that may rewrite to non-resolving tags, it's left out of the matrix. The analysis below is retained so it can be re-added deliberately if those questions are resolved.
 
 ### What's there
 
@@ -93,40 +95,11 @@ skip: any image ending in `:latest`
 skip: any image not matching the released filter's repo basename
 ```
 
-## Section 3 — `eval-demo-pipelines`
+## Section 3 — `eval-demo-pipelines` (removed — never existed)
 
-### What's there
+This section originally specified `PlainsightAI/eval-demo-pipelines` as a third cascade consumer with three coexisting pin shapes (bare DockerHub/Scarf literal, bare GAR literal, and a `${VAR:-default}` env override). **That repo never existed.** `gh repo view PlainsightAI/eval-demo-pipelines` returns `Could not resolve to a Repository`, and the org audit log shows zero create/rename/destroy footprint for the name — so it is not a rename or a deletion either. The entry was authored speculatively during Phase 1 and shipped into the cascade matrix in #19, where it 404'd on clone for every production filter release and fired the "human needs to investigate" Slack alert.
 
-Filter image pins across `filters/*/docker-compose*.yaml` and `scripts/docker-compose.*.yaml`. Three distinct pin shapes coexist:
-
-```yaml
-# Shape A — bare literal, DockerHub mirror
-image: containers.openfilter.io/plainsightai/openfilter-video-in:v0.1.10
-# Shape B — bare literal, GAR (prod and dev)
-image: us-west1-docker.pkg.dev/plainsightai-prod/oci/filter-json-transform:0.1.0
-image: us-west1-docker.pkg.dev/plainsightai-dev/oci/filter-sam3-detector:0.2.0-dev
-# Shape C — env-var override with default
-image: ${SAM3_IMAGE:-us-west1-docker.pkg.dev/plainsightai-prod/oci/filter-sam3-detector:0.1.2-dev}
-```
-
-`containers.openfilter.io` resolves to `gateway.scarf.sh` — Scarf is a registry analytics proxy that fronts DockerHub. From a release-tag perspective the Scarf URL and the DockerHub URL refer to the same image. The cascade should treat the two as equivalent when matching repo basenames.
-
-Shape C is the most common in `scripts/`. The default inside `${VAR:-default}` is the cascade target; the surrounding `${VAR:-…}` machinery stays in place so local overrides keep working.
-
-### Bump strategy
-
-```text
-in:  filters/*/docker-compose*.yaml, scripts/docker-compose.*.yaml
-pin: shape A | shape B | shape C above
-out:
-  shape A:  image: <same-prefix>/<name>:<new>
-  shape B:  image: <same-prefix>/<name>:<new>
-  shape C:  image: ${<VAR>:-<same-prefix>/<name>:<new>}
-skip: any image whose tag is `local` or a developer fixture (e.g. `filter-grounding-dino:local`)
-skip: any image not matching the released filter's repo basename
-```
-
-Implementation hint: a single regex with three alternation arms is brittle. Prefer a two-pass approach — first identify the file's pin shape per line, then rewrite. `yq` is shape-agnostic only for shape A/B; shape C requires string-level surgery on the value because `yq` collapses the `${VAR:-…}` envelope.
+It has been removed from the cascade matrix. No real repo was an obvious typo target — a scan of the `PlainsightAI` org surfaced no `docker-compose`-pinning consumer matching the described layout — so this was dropped, not renamed. If a Docker-Compose-based consumer is later stood up, enrol it by adding a row to the bump matrix in `cascade-pipeline-bumps.yaml` and restoring a strategy section here describing its pin shapes.
 
 ## Section 4 — `openfilter-hub` (rejected)
 
@@ -151,9 +124,11 @@ PipelineInstance CRs created at runtime by `openfilter-pipelines-controller` are
    - any tag of form `:local` or `:<repo>-local` (developer fixture)
    - any image whose `image:` line carries a flux `$imagepolicy` trailing comment
 
-4. **Matrix shape.** Three consumer repos × N pin sites. The cascade should fan out per-consumer (matching first-level cascade shape: `strategy.matrix.consumer`), not per pin site. Each shard's bump strategy script does its own intra-repo scan.
+4. **Matrix shape.** The cascade fans out per-consumer (`strategy.matrix.consumer`), not per pin site — each shard's bump strategy script does its own intra-repo scan. The consumer set is a hardcoded matrix in `cascade-pipeline-bumps.yaml` (one live entry today: `openfilter-pipelines-controller`); a per-shard resolve-check fails the shard loudly if an entry doesn't resolve, so a typo can't silently 404 on clone as `eval-demo-pipelines` did.
 
-5. **`open-mechanical-pr` branch_prefix.** Use `bump-filter-<name>-` to keep the supersede-stale logic scoped per released filter — so a faceblur release doesn't close a still-open frame-dedup bump PR.
+5. **Fleet-deduplicated second-level Slack alert.** This cascade fires once per filter release, so a multi-filter openfilter wave produces N independent runs in N filter-repo Actions contexts. Concurrency groups are per-repo and cannot coalesce them, so a naive per-run notify multiplies N× (the eval-demo phantom made this unmissable: 8 filters × 1 phantom shard = 8 pages per release). The notify job dedups via a cross-repo claim lock: it hashes the failure identity `(consumer, failure_class, UTC hour)` — filter name/version excluded, since that's the collapsed dimension — and atomically creates `refs/notify-claims/<hour>/<hash>` in `gh-actions-public` (git ref creation is a compare-and-swap: 201 wins, 422 means a sibling already claimed it). Exactly one run posts; the rest skip. Claim failure with no existing ref fails open (posts) so an alert is never lost to a flaky lock. Stale locks are aged out hourly by `gc-notify-claims.yaml`. Wave-level alerting for the *first* level still lives independently at `openfilter/.github/workflows/cascade-on-tag.yaml`.
+
+6. **`open-mechanical-pr` branch_prefix.** Use `bump-filter-<name>-` to keep the supersede-stale logic scoped per released filter — so a faceblur release doesn't close a still-open frame-dedup bump PR.
 
 ## Open questions to resolve before Phase 2 ships
 
