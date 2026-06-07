@@ -311,9 +311,26 @@ jobs:
           # matrix straight from the running workflow definition (the single
           # source of truth) and, if it names more than one consumer, fail
           # open: skip dedup and post unconditionally, flagging the drift loud.
-          WF_B64="$(gh api "repos/${OPS_REPO}/contents/.github/workflows/cascade-pipeline-bumps.yaml?ref=${OPS_BRANCH}" --jq '.content' 2>/dev/null | tr -d '\n')"
-          CONSUMER_COUNT="$(printf '%s' "${WF_B64}" | base64 -d 2>/dev/null \
-            | awk '/^        consumer:/{f=1; next} f && /^          - /{n++; next} f && !/^[[:space:]]*$/{f=0} END{print n+0}')"
+          # Distinguish three failure modes so an operator isn't sent to
+          # investigate a phantom matrix change: (a) the fetch blipped, (b) the
+          # matrix block couldn't be located (reformat / commented-out rows),
+          # (c) genuine drift to >1 consumer. All three fail open (post=true);
+          # only (c) is a real "fold it into the hash" action item.
+          WF_YAML="$(gh api "repos/${OPS_REPO}/contents/.github/workflows/cascade-pipeline-bumps.yaml?ref=${OPS_BRANCH}" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null)"
+          if [ -z "${WF_YAML}" ]; then
+            echo "::warning::could not read bump matrix (transient ${OPS_REPO} contents fetch failure or empty body); posting without dedup. Not a matrix change — no action needed unless this recurs."
+            echo "post=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Track whether the matrix block was found at all (f_seen),
+          # separately from how many consumers it lists (n).
+          CONSUMER_COUNT="$(printf '%s' "${WF_YAML}" \
+            | awk '/^        consumer:/{f=1; f_seen=1; next} f && /^          - /{n++; next} f && !/^[[:space:]]*$/{f=0} END{print (f_seen ? n+0 : "nomatch")}')"
+          if [ "${CONSUMER_COUNT}" = "nomatch" ]; then
+            echo "::warning::bump matrix block not found in the workflow definition (likely a reformat or commented-out rows changed the indentation the parser keys on); posting without dedup. Verify the matrix shape, not the dedup identity."
+            echo "post=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${CONSUMER_COUNT}" != "1" ]; then
             echo "::error::bump matrix has ${CONSUMER_COUNT} consumers but the notify dedup identity hardcodes a single CONSUMER (${CONSUMER}); fold the failed consumer into the hash. Posting without dedup to avoid suppressing a distinct consumer's failure."
             echo "post=true" >> "$GITHUB_OUTPUT"
