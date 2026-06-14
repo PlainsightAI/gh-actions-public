@@ -231,7 +231,7 @@ jobs:
           sudo docker builder prune -a --force || true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # No `docker login` here on purpose: `load: true` below keeps the image
       # in the local daemon and the composite runs against `localhost/filter`,
@@ -258,7 +258,7 @@ jobs:
       # local-only namespace (no production repo coordinates), so the
       # composite's `docker run` resolves locally instead of pulling.
       - name: Build Docker image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -405,7 +405,7 @@ jobs:
           twine check "$dist_file"
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-dist
           path: dist/
@@ -427,7 +427,7 @@ jobs:
         run: python -m pip install --upgrade twine
 
       - name: Download wheel artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wheel-dist
           path: dist/
@@ -453,10 +453,10 @@ jobs:
           sudo docker builder prune -a --force || true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ inputs.dockerhub_username }}
           password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
@@ -487,7 +487,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ inputs.docker_image }}
           tags: |
@@ -495,7 +495,7 @@ jobs:
             type=raw,value=skip
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
