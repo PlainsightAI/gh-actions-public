@@ -163,7 +163,7 @@ runs:
       if: |
         inputs.dry_run != 'true' && inputs.schema_module != ''
         && (steps.emit_config.outputs.emitted == 'true' || steps.emit_output.outputs.emitted == 'true')
-      uses: oras-project/setup-oras@v1
+      uses: oras-project/setup-oras@v2
 
     # oras attach refuses absolute file paths by default; even with
     # --disable-path-validation, the absolute path is embedded in the

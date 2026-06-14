@@ -24,18 +24,23 @@ runs:
       # overhead in larger repositories. This shallow clone provides enough git history
       # (exactly 2 commits) to compare files and make incremental commits without
       # downloading the entire repository history.
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         fetch-depth: 2
         token: ${{ inputs.gh-bot-user-pat }}
 
     - name: Download image policy
-      uses: dsaltares/fetch-gh-release-asset@1.1.2
-      with:
-        repo: 'PlainsightAI/infrastructure-tooling'
-        version: 'tags/image-policy-applier/v0.1.2'
-        file: 'image-policy-applier'
-        token: ${{ inputs.gh-bot-user-pat }}
+      # Uses the pre-installed gh CLI instead of dsaltares/fetch-gh-release-asset,
+      # which has no Node 24 release and trips the Node 20 deprecation warning.
+      run: |
+        gh release download "image-policy-applier/v0.1.2" \
+          --repo PlainsightAI/infrastructure-tooling \
+          --pattern image-policy-applier \
+          --output image-policy-applier \
+          --clobber
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-bot-user-pat }}
 
     - name: Apply image policy
       run: |
