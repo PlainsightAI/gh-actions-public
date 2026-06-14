@@ -103,7 +103,7 @@ jobs:
           printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
 
       - name: Download Grype
-        uses: anchore/scan-action/download-grype@v3
+        uses: anchore/scan-action/download-grype@v7
         id: grype
         with:
           grype-version: ${{ inputs.grype_version }}
