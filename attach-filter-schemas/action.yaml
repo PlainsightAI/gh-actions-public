@@ -77,15 +77,42 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # Pull the image once, up front, OUTSIDE the per-emit timeout.
+    #
+    # For multi-platform pushed images (Docker Hub path) the image is not in
+    # the local daemon, so the subsequent `docker run` would otherwise pull
+    # it implicitly — and that pull would run inside the emit step's
+    # `timeout`. Filter images are multi-GB (e.g. PyTorch-based), so a cold
+    # pull routinely exceeds the emit budget and the timeout fires while
+    # docker is still pulling layers, before emit-schema ever runs. Pulling
+    # here keeps the emit timeout scoped to the actual schema emit.
+    #
+    # Skipped when the image is already local (single-platform `load: true`
+    # build, including dry-run) — `docker pull` would fail or be wasteful
+    # for an image that was never pushed.
+    - name: Pull image for schema emit
+      if: inputs.schema_module != ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if docker image inspect "${IMAGE}:${VERSION}" > /dev/null 2>&1; then
+          echo "Image ${IMAGE}:${VERSION} already present locally — skipping pull."
+        else
+          echo "Pulling ${IMAGE}:${VERSION} for schema emit..."
+          timeout 600 docker pull "${IMAGE}:${VERSION}"
+        fi
+
     # Emit schemas against the built image so the filter's deps (including
     # openfilter itself) are guaranteed to be present without touching the
     # runner's Python env. `--entrypoint python` overrides the filter's
     # runtime entrypoint so we can invoke the CLI module directly.
     #
-    # For multi-platform pushed images (Docker Hub path), the image is not
-    # in the local daemon and `docker run` will pull the runner's-platform
-    # variant from the registry — adds a pull, but emit-schema is platform-
-    # agnostic so any variant produces an equivalent schema.
+    # The image is guaranteed local by the pull step above, so the `timeout`
+    # below covers only the emit itself (module import + schema dump), not a
+    # registry pull.
     - name: Emit config schema
       id: emit_config
       if: inputs.schema_module != ''
@@ -100,7 +127,7 @@ runs:
         set -euo pipefail
         spec="$SCHEMA_MODULE"
         [ -n "$SCHEMA_CLASS" ] && spec="${spec}:${SCHEMA_CLASS}"
-        if timeout 60 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
+        if timeout 120 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
             -m openfilter.cli emit-schema --kind config "$spec" \
             > "$SCHEMA_PATH" 2> "${RUNNER_TEMP}/emit-config.err"; then
           # Guard against a 0-exit with empty/invalid stdout (disk full,
@@ -138,7 +165,7 @@ runs:
         set -euo pipefail
         spec="$SCHEMA_MODULE"
         [ -n "$SCHEMA_CLASS" ] && spec="${spec}:${SCHEMA_CLASS}"
-        if timeout 60 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
+        if timeout 120 docker run --rm --entrypoint python "${IMAGE}:${VERSION}" \
             -m openfilter.cli emit-schema --kind output "$spec" \
             > "$SCHEMA_PATH" 2> "${RUNNER_TEMP}/emit-output.err"; then
           if ! jq -e . "$SCHEMA_PATH" > /dev/null 2>&1; then
