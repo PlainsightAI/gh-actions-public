@@ -82,8 +82,16 @@ runs:
         case "${PERM_STATUS:-}" in
           200)
             ROLE=$(printf '%s' "$PERM_BODY" | jq -r '.role_name // empty')
+            # GitHub returns an empty role_name for accounts that hold no
+            # collaborator role — notably GitHub Apps such as dependabot[bot],
+            # which come back as HTTP 200 with "permission":"none","role_name":"".
+            # Fall back to the legacy .permission field (admin/write/read/none),
+            # which is sufficient for the trust decision below.
             if [[ -z "$ROLE" ]]; then
-              echo "ERROR: permission response missing .role_name; raw body follows:"
+              ROLE=$(printf '%s' "$PERM_BODY" | jq -r '.permission // empty')
+            fi
+            if [[ -z "$ROLE" ]]; then
+              echo "ERROR: permission response missing both .role_name and .permission; raw body follows:"
               printf '%s\n' "$PERM_BODY"
               exit 1
             fi
