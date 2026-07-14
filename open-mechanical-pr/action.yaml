@@ -92,9 +92,13 @@ inputs:
       ci-gated mode only. When a PR reports no checks at all, wait this
       many seconds (re-polling) before concluding the repo genuinely has no
       CI and treating the PR as green. Guards against a race where CI has
-      not yet registered its checks on a just-opened PR. Defaults to 30.
+      not yet registered its checks on a just-opened PR. Defaults to 90.
+      The action clamps this up to a hard 60s minimum: GitHub Actions can
+      take the better part of a minute to register check runs on a fresh
+      PR, so a shorter window risks bypass-merging before any required
+      check appears.
     required: false
-    default: '30'
+    default: '90'
   base_branch:
     description: |
       Base branch the PR targets and the supersede step queries against.
@@ -121,6 +125,9 @@ runs:
       env:
         MERGE_METHOD: ${{ inputs.merge_method }}
         MERGE_MODE: ${{ inputs.merge_mode }}
+        CI_POLL_TIMEOUT: ${{ inputs.ci_poll_timeout_seconds }}
+        CI_POLL_INTERVAL: ${{ inputs.ci_poll_interval_seconds }}
+        NO_CHECKS_GRACE: ${{ inputs.no_checks_grace_seconds }}
       run: |
         # Validate merge_method unconditionally — even when auto_merge is
         # 'false', so that a typo in test runs that disable auto-merge fails
@@ -142,6 +149,26 @@ runs:
             exit 1
             ;;
         esac
+
+        # Same fail-fast rationale for the ci-gated poll knobs: a bad value
+        # (empty, non-numeric, negative, or zero) would otherwise surface deep
+        # in the poll loop, after the branch and PR are already open, as a
+        # busy-loop, an integer-comparison error, or an instant timeout. Reject
+        # anything that is not a positive integer here. These are validated even
+        # in 'auto' mode so a typo fails before any branch/PR is created.
+        for pair in \
+          "ci_poll_timeout_seconds=$CI_POLL_TIMEOUT" \
+          "ci_poll_interval_seconds=$CI_POLL_INTERVAL" \
+          "no_checks_grace_seconds=$NO_CHECKS_GRACE"; do
+          name="${pair%%=*}"
+          val="${pair#*=}"
+          case "$val" in
+            ''|0|*[!0-9]*)
+              echo "ERROR: invalid $name '$val' (expected a positive integer)."
+              exit 1
+              ;;
+          esac
+        done
 
         git config user.name "plainsight-bot"
         git config user.email "cloudinfra@plainsight.ai"
@@ -356,6 +383,19 @@ runs:
         # that is a status signal, not a command error, so every gh call that
         # can legitimately exit nonzero is guarded by `if`/`|| true` to keep
         # -e from aborting the poll.
+        # Hard floor on the no-checks grace window. The no-CI fast-path treats
+        # a sustained absence of checks as green, but GitHub Actions can take
+        # the better part of a minute to register check runs on a just-opened
+        # PR. Clamp the configured grace up to this minimum regardless of input
+        # so the fast-path cannot be tuned short enough to bypass-merge before
+        # a required check has had a fair chance to appear. Costs a one-time
+        # wait only on repos that genuinely have no CI.
+        MIN_NO_CHECKS_GRACE=60
+        if [ "$NO_CHECKS_GRACE" -lt "$MIN_NO_CHECKS_GRACE" ]; then
+          echo "no_checks_grace_seconds=${NO_CHECKS_GRACE} is below the ${MIN_NO_CHECKS_GRACE}s floor; using ${MIN_NO_CHECKS_GRACE}s."
+          NO_CHECKS_GRACE="$MIN_NO_CHECKS_GRACE"
+        fi
+
         deadline=$(( $(date +%s) + POLL_TIMEOUT ))
         no_checks_since=""
 
@@ -370,7 +410,7 @@ runs:
           # Capture the checks JSON regardless of gh's status-derived exit
           # code. On failure we branch on WHY: a genuine "no checks reported"
           # message vs a transient API error (rate limit, 5xx, network).
-          if checks_json=$(gh pr checks "$PR_URL" --json bucket,state 2>/tmp/gh_checks_err); then
+          if checks_json=$(gh pr checks "$PR_URL" --json bucket 2>/tmp/gh_checks_err); then
             :
           else
             gh_rc=$?
