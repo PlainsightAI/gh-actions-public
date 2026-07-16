@@ -156,6 +156,12 @@ runs:
         # busy-loop, an integer-comparison error, or an instant timeout. Reject
         # anything that is not a positive integer here. These are validated even
         # in 'auto' mode so a typo fails before any branch/PR is created.
+        #
+        # Leading zeros are rejected too (the `0*` glob): arithmetic `$(( ))`
+        # reads a value like 0600 as OCTAL (384), while `sleep` and `[ … -lt … ]`
+        # read it as DECIMAL (600). Allowing it would make the same input mean
+        # two different durations across the poll guard. Requiring canonical
+        # base-10 (no leading zeros) keeps every consumer consistent.
         for pair in \
           "ci_poll_timeout_seconds=$CI_POLL_TIMEOUT" \
           "ci_poll_interval_seconds=$CI_POLL_INTERVAL" \
@@ -163,8 +169,8 @@ runs:
           name="${pair%%=*}"
           val="${pair#*=}"
           case "$val" in
-            ''|0|*[!0-9]*)
-              echo "ERROR: invalid $name '$val' (expected a positive integer)."
+            ''|0*|*[!0-9]*)
+              echo "ERROR: invalid $name '$val' (expected a positive integer with no leading zeros)."
               exit 1
               ;;
           esac
