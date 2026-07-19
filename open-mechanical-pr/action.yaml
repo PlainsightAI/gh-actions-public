@@ -3,9 +3,11 @@ description: |
   Opens a bot-authored pull request from working-tree changes (modifications
   and untracked files). Supersedes any open PRs whose head branch shares the
   configured prefix, commits + pushes a fresh branch named
-  ${branch_prefix}${short_sha}-${github_run_id}, opens the PR, and (by
-  default) enables native auto-merge. Idempotent: a clean working tree exits
-  successfully without doing anything.
+  ${branch_prefix}${short_sha}-${github_run_id}, opens the PR, and then merges
+  it per `merge_mode`: 'auto' (default) enables GitHub native auto-merge;
+  'ci-gated' polls the PR's CI and bypass-merges on green as a ruleset bypass
+  actor (and exits nonzero on failure/timeout so the caller can alert).
+  Idempotent: a clean working tree exits successfully without doing anything.
 
   Lifted from the supersede + push + create logic of client-portal's
   update-api-client.yaml so cascade workflows (openfilter, gh-actions, …)
@@ -44,9 +46,59 @@ inputs:
     required: false
     default: 'true'
   merge_method:
-    description: "Merge method passed to 'gh pr merge --auto': squash | merge | rebase."
+    description: "Merge method passed to 'gh pr merge': squash | merge | rebase."
     required: false
     default: 'squash'
+  merge_mode:
+    description: |
+      How the bot PR is merged once opened:
+        - 'auto' (default): enable GitHub native auto-merge
+          (`gh pr merge --auto`). GitHub merges when the target branch's
+          protection is satisfied. This is the legacy behaviour and is a
+          soft no-op on repos with no branch protection.
+        - 'ci-gated': poll the PR's own CI checks to a terminal state, then
+          on all-green call the REST merge endpoint
+          (`PUT /repos/{owner}/{repo}/pulls/{n}/merge`) as an *immediate*
+          merge performed by the bot, which the org/repo ruleset honors
+          because the bot is a configured `bypass_actor` (mode: always). This
+          is a scoped ruleset bypass, NOT a repo-admin override. (`gh pr merge`
+          is unusable here: its preflight refuses the merge on unmet required
+          reviews even for a bypass-authorized caller — cli/cli#13388.) On any
+          failed/cancelled check, or if CI does not finish within
+          `ci_poll_timeout_seconds`, leave the PR open and exit nonzero so the
+          caller's failure-notify job fires.
+      Use 'ci-gated' where an org ruleset requires reviews that native
+      auto-merge cannot satisfy: native auto-merge (`gh pr merge --auto`) is a
+      deferred merge that does NOT honor `bypass_actors`, so an immediate
+      bypass-actor merge is required. Only takes effect when `auto_merge` is
+      'true'.
+    required: false
+    default: 'auto'
+  ci_poll_timeout_seconds:
+    description: |
+      ci-gated mode only. Maximum seconds to poll the consumer PR's CI
+      before giving up. On timeout the PR is left open and the step exits
+      nonzero. Defaults to 600 (10 minutes).
+    required: false
+    default: '600'
+  ci_poll_interval_seconds:
+    description: |
+      ci-gated mode only. Seconds to sleep between CI check polls.
+      Defaults to 15.
+    required: false
+    default: '15'
+  no_checks_grace_seconds:
+    description: |
+      ci-gated mode only. When a PR reports no checks at all, wait this
+      many seconds (re-polling) before concluding the repo genuinely has no
+      CI and treating the PR as green. Guards against a race where CI has
+      not yet registered its checks on a just-opened PR. Defaults to 90.
+      The action clamps this up to a hard 60s minimum: GitHub Actions can
+      take the better part of a minute to register check runs on a fresh
+      PR, so a shorter window risks bypass-merging before any required
+      check appears.
+    required: false
+    default: '90'
   base_branch:
     description: |
       Base branch the PR targets and the supersede step queries against.
@@ -72,6 +124,10 @@ runs:
       working-directory: ${{ inputs.working_directory }}
       env:
         MERGE_METHOD: ${{ inputs.merge_method }}
+        MERGE_MODE: ${{ inputs.merge_mode }}
+        CI_POLL_TIMEOUT: ${{ inputs.ci_poll_timeout_seconds }}
+        CI_POLL_INTERVAL: ${{ inputs.ci_poll_interval_seconds }}
+        NO_CHECKS_GRACE: ${{ inputs.no_checks_grace_seconds }}
       run: |
         # Validate merge_method unconditionally — even when auto_merge is
         # 'false', so that a typo in test runs that disable auto-merge fails
@@ -83,6 +139,42 @@ runs:
             exit 1
             ;;
         esac
+
+        # Same fail-fast rationale for merge_mode: catch a typo before any
+        # branch/PR is created rather than after the PR is already open.
+        case "$MERGE_MODE" in
+          auto|ci-gated) ;;
+          *)
+            echo "ERROR: invalid merge_mode '$MERGE_MODE' (expected auto|ci-gated)."
+            exit 1
+            ;;
+        esac
+
+        # Same fail-fast rationale for the ci-gated poll knobs: a bad value
+        # (empty, non-numeric, negative, or zero) would otherwise surface deep
+        # in the poll loop, after the branch and PR are already open, as a
+        # busy-loop, an integer-comparison error, or an instant timeout. Reject
+        # anything that is not a positive integer here. These are validated even
+        # in 'auto' mode so a typo fails before any branch/PR is created.
+        #
+        # Leading zeros are rejected too (the `0*` glob): arithmetic `$(( ))`
+        # reads a value like 0600 as OCTAL (384), while `sleep` and `[ … -lt … ]`
+        # read it as DECIMAL (600). Allowing it would make the same input mean
+        # two different durations across the poll guard. Requiring canonical
+        # base-10 (no leading zeros) keeps every consumer consistent.
+        for pair in \
+          "ci_poll_timeout_seconds=$CI_POLL_TIMEOUT" \
+          "ci_poll_interval_seconds=$CI_POLL_INTERVAL" \
+          "no_checks_grace_seconds=$NO_CHECKS_GRACE"; do
+          name="${pair%%=*}"
+          val="${pair#*=}"
+          case "$val" in
+            ''|0*|*[!0-9]*)
+              echo "ERROR: invalid $name '$val' (expected a positive integer with no leading zeros)."
+              exit 1
+              ;;
+          esac
+        done
 
         git config user.name "plainsight-bot"
         git config user.email "cloudinfra@plainsight.ai"
@@ -242,7 +334,7 @@ runs:
         echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
 
     - name: Enable native auto-merge
-      if: steps.precheck.outputs.has_changes == 'true' && inputs.auto_merge == 'true'
+      if: steps.precheck.outputs.has_changes == 'true' && inputs.auto_merge == 'true' && inputs.merge_mode == 'auto'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       env:
@@ -268,4 +360,160 @@ runs:
           echo "WARN: 'gh pr merge --auto --$MERGE_METHOD' failed for $PR_URL."
           echo "WARN: Likely cause: target branch has no protection rule, so auto-merge"
           echo "WARN: is not enabled for the repo. PR remains open for manual merge."
+        fi
+
+    - name: Poll CI then bypass-merge
+      if: steps.precheck.outputs.has_changes == 'true' && inputs.auto_merge == 'true' && inputs.merge_mode == 'ci-gated'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+        MERGE_METHOD: ${{ inputs.merge_method }}
+        POLL_TIMEOUT: ${{ inputs.ci_poll_timeout_seconds }}
+        POLL_INTERVAL: ${{ inputs.ci_poll_interval_seconds }}
+        NO_CHECKS_GRACE: ${{ inputs.no_checks_grace_seconds }}
+      run: |
+        # ci-gated merge: native auto-merge (`gh pr merge --auto`) is a
+        # deferred merge that does NOT honour an org ruleset's bypass_actors,
+        # so mechanical bump PRs sit open forever waiting on a review that the
+        # cascade is entitled to bypass. Instead we own the merge decision
+        # here: poll THIS PR's CI to a terminal state, then merge via an
+        # immediate call to the REST merge endpoint performed as a ruleset
+        # bypass actor (bot team 4637420, bypass_mode always) only when
+        # everything is green. The bypass applies because the merge is
+        # immediate; the deferred `--auto` queue is ignored by bypass_actors.
+        #
+        # `set -e`/pipefail are on by default in composite bash steps. gh pr
+        # checks exits nonzero while checks are pending (8) or failing (1) —
+        # that is a status signal, not a command error, so every gh call that
+        # can legitimately exit nonzero is guarded by `if`/`|| true` to keep
+        # -e from aborting the poll.
+        # Hard floor on the no-checks grace window. The no-CI fast-path treats
+        # a sustained absence of checks as green, but GitHub Actions can take
+        # the better part of a minute to register check runs on a just-opened
+        # PR. Clamp the configured grace up to this minimum regardless of input
+        # so the fast-path cannot be tuned short enough to bypass-merge before
+        # a required check has had a fair chance to appear. Costs a one-time
+        # wait only on repos that genuinely have no CI.
+        MIN_NO_CHECKS_GRACE=60
+        if [ "$NO_CHECKS_GRACE" -lt "$MIN_NO_CHECKS_GRACE" ]; then
+          echo "no_checks_grace_seconds=${NO_CHECKS_GRACE} is below the ${MIN_NO_CHECKS_GRACE}s floor; using ${MIN_NO_CHECKS_GRACE}s."
+          NO_CHECKS_GRACE="$MIN_NO_CHECKS_GRACE"
+        fi
+
+        deadline=$(( $(date +%s) + POLL_TIMEOUT ))
+        no_checks_since=""
+
+        while :; do
+          now=$(date +%s)
+          if [ "$now" -ge "$deadline" ]; then
+            echo "ERROR: CI did not reach a terminal state within ${POLL_TIMEOUT}s for $PR_URL."
+            echo "ERROR: Leaving the PR open for a human; not bypass-merging."
+            exit 1
+          fi
+
+          # Capture the checks JSON regardless of gh's status-derived exit
+          # code. On failure we branch on WHY: a genuine "no checks reported"
+          # message vs a transient API error (rate limit, 5xx, network).
+          if checks_json=$(gh pr checks "$PR_URL" --json bucket 2>/tmp/gh_checks_err); then
+            :
+          else
+            gh_rc=$?
+            if grep -qi "no checks reported" /tmp/gh_checks_err; then
+              # Distinct, expected condition: PR base has no configured checks.
+              checks_json='[]'
+            elif [ -z "${checks_json:-}" ]; then
+              # Empty stdout + a non-"no checks" nonzero exit → transient.
+              # Back off and retry; the overall deadline still bounds us.
+              echo "WARN: transient 'gh pr checks' error (exit ${gh_rc}); retrying in ${POLL_INTERVAL}s."
+              cat /tmp/gh_checks_err || true
+              sleep "$POLL_INTERVAL"
+              continue
+            fi
+            # else: nonzero exit but we DID get JSON (pending/failing) → parse.
+          fi
+
+          total=$(printf '%s' "$checks_json" | jq 'length')
+
+          if [ "$total" -eq 0 ]; then
+            # No checks on this PR. Distinguish "repo genuinely has no CI"
+            # from "CI has not registered its checks yet" by requiring the
+            # no-checks state to persist for a grace window before we treat
+            # the PR as green. Without this, a just-opened PR could be
+            # bypass-merged in the split second before its workflows appear.
+            if [ -z "$no_checks_since" ]; then
+              no_checks_since="$now"
+            fi
+            elapsed=$(( now - no_checks_since ))
+            if [ "$elapsed" -ge "$NO_CHECKS_GRACE" ]; then
+              echo "No checks reported after ${elapsed}s grace; treating as green (mechanical bump)."
+              break
+            fi
+            echo "No checks reported yet (${elapsed}s/${NO_CHECKS_GRACE}s grace); waiting for CI to register."
+            sleep "$POLL_INTERVAL"
+            continue
+          fi
+
+          # Checks exist → reset the no-checks grace tracker in case a prior
+          # poll saw none (checks registered late).
+          no_checks_since=""
+
+          pending=$(printf '%s' "$checks_json" | jq '[.[] | select(.bucket == "pending")] | length')
+          failed=$(printf '%s' "$checks_json" | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length')
+
+          if [ "$pending" -gt 0 ]; then
+            echo "CI still running: ${pending}/${total} pending; polling again in ${POLL_INTERVAL}s."
+            sleep "$POLL_INTERVAL"
+            continue
+          fi
+
+          # Terminal: nothing pending. "green" == every check settled in a
+          # non-failing bucket (pass or skipping); any fail/cancel is red.
+          if [ "$failed" -gt 0 ]; then
+            echo "ERROR: ${failed}/${total} checks failed or were cancelled on $PR_URL."
+            echo "ERROR: Leaving the PR open; not bypass-merging."
+            gh pr checks "$PR_URL" || true
+            exit 1
+          fi
+
+          echo "All ${total} checks green (pass/skipping) on $PR_URL."
+          break
+        done
+
+        # Green (or intentionally no-CI). Merge via the REST merge endpoint
+        # directly, NOT `gh pr merge`. This immediate merge relies on the
+        # bot's ruleset bypass membership (bot team 4637420, bypass_mode
+        # always) rather than admin: the REST endpoint
+        # `PUT /repos/{owner}/{repo}/pulls/{n}/merge` honours the bot's
+        # bypass_actors membership, whereas native auto-merge does not.
+        # `gh pr merge` cannot be used here: its client-side preflight refuses
+        # the merge when required reviews are unmet even for a caller with
+        # bypass authority (cli/cli#13388), and its `--admin` escape would
+        # require repo admin the bot may not hold — it only reliably holds
+        # ruleset bypass via team 4637420. Where the bot is NOT a bypass actor
+        # on a target repo, this API merge fails and the step exits nonzero,
+        # which is the correct signal for the caller's failure-notify job
+        # (same failure semantics as before, just a scoped bypass instead of
+        # an admin override).
+        #
+        # Derive owner/repo/number from the PR URL
+        # (https://github.com/<owner>/<repo>/pull/<n>).
+        pr_path="${PR_URL#https://github.com/}"   # <owner>/<repo>/pull/<n>
+        owner_repo="${pr_path%%/pull/*}"          # <owner>/<repo>
+        pr_number="${pr_path##*/pull/}"           # <n>
+
+        echo "Bypass-merging $PR_URL via REST merge API (method=$MERGE_METHOD) as ruleset bypass actor."
+        # MERGE_METHOD values (squash|merge|rebase) already match the API's
+        # merge_method enum, so no translation is needed.
+        gh api --method PUT "repos/${owner_repo}/pulls/${pr_number}/merge" \
+          -f "merge_method=${MERGE_METHOD}" >/dev/null
+
+        # The REST merge endpoint does not delete the head branch; do it
+        # explicitly. Best-effort: a failure here must NOT fail the step (the
+        # merge already succeeded, so branch cleanup is cosmetic).
+        head_ref=$(gh pr view "$PR_URL" --json headRefName -q .headRefName 2>/dev/null || true)
+        if [ -n "${head_ref:-}" ]; then
+          gh api --method DELETE "repos/${owner_repo}/git/refs/heads/${head_ref}" >/dev/null 2>&1 || \
+            echo "WARN: could not delete head branch ${head_ref} (merge already succeeded)."
         fi
