@@ -33,8 +33,9 @@ description: >
 inputs:
   image:
     description: >
-      Full image path the schemas should attach to, including registry
-      and repository but no tag. Must already exist locally
+      Image path the schemas should attach to, excluding the tag. Bare references
+      (e.g., plainsightai/openfilter-sam3-detector) are automatically normalized
+      to docker.io/. Must already exist locally
       (single-platform `load: true` build) or be pullable from the
       registry (multi-platform `push: true` build), because
       `docker run --entrypoint python "${image}:${version}"` is how
@@ -79,6 +80,7 @@ runs:
   steps:
     - name: Normalize image reference
       id: normalize
+      if: inputs.schema_module != ''
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
