@@ -272,7 +272,7 @@ jobs:
       # Emit-only — attach is skipped via dry_run. No-op when schema_module
       # is empty (filters that haven't migrated to FilterConfigBase).
       - name: Emit schemas (dry-run; no attach)
-        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@lmyers/plat-1198-registry-normalization
+        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@main
         with:
           image: localhost/filter
           version: pr-${{ github.event.number }}
@@ -515,7 +515,7 @@ jobs:
       # from Docker Hub (we're already logged in above) since multi-platform
       # build-push doesn't load the image into the local daemon.
       - name: Attach config + output schemas (FILTER-453)
-        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@lmyers/plat-1198-registry-normalization
+        uses: PlainsightAI/gh-actions-public/attach-filter-schemas@main
         with:
           image: ${{ inputs.docker_image }}
           version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
