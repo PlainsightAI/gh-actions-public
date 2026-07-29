@@ -87,8 +87,8 @@ runs:
         # Extract the segment before the first slash
         first_part="${IMAGE%%/*}"
         
-        # A fully-qualified registry host will contain a '.' (e.g., gcr.io) or a ':' (e.g., localhost:5001)
-        if [[ "$first_part" =~ \. || "$first_part" =~ : ]]; then
+        # A fully-qualified registry host will contain a '.' (e.g., gcr.io), a ':' (e.g., localhost:5001), or be exactly 'localhost'
+        if [[ "$first_part" =~ \. || "$first_part" =~ : || "$first_part" == "localhost" ]]; then
           echo "Using fully-qualified image coordinate: $IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
         else
