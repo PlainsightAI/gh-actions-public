@@ -33,8 +33,9 @@ description: >
 inputs:
   image:
     description: >
-      Full image path the schemas should attach to, including registry
-      and repository but no tag. Must already exist locally
+      Image path the schemas should attach to, excluding the tag. Bare references
+      (e.g., plainsightai/openfilter-sam3-detector) are automatically normalized
+      to docker.io/. Must already exist locally
       (single-platform `load: true` build) or be pullable from the
       registry (multi-platform `push: true` build), because
       `docker run --entrypoint python "${image}:${version}"` is how
@@ -77,6 +78,26 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Normalize image reference
+      id: normalize
+      if: inputs.schema_module != ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        # Extract the segment before the first slash
+        first_part="${IMAGE%%/*}"
+        
+        # A fully-qualified registry host will contain a '.' (e.g., gcr.io), a ':' (e.g., localhost:5001), or be exactly 'localhost'
+        if [[ "$first_part" =~ \. || "$first_part" =~ : || "$first_part" == "localhost" ]]; then
+          echo "Using fully-qualified image coordinate: $IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+        else
+          echo "Bare image reference detected. Normalizing to: docker.io/$IMAGE"
+          echo "image=docker.io/$IMAGE" >> "$GITHUB_OUTPUT"
+        fi
+
     # Pull the image once, up front, OUTSIDE the per-emit timeout.
     #
     # For multi-platform pushed images (Docker Hub path) the image is not in
@@ -94,7 +115,7 @@ runs:
       if: inputs.schema_module != ''
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
+        IMAGE: ${{ steps.normalize.outputs.image }}
         VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
@@ -118,7 +139,7 @@ runs:
       if: inputs.schema_module != ''
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
+        IMAGE: ${{ steps.normalize.outputs.image }}
         VERSION: ${{ inputs.version }}
         SCHEMA_MODULE: ${{ inputs.schema_module }}
         SCHEMA_CLASS: ${{ inputs.schema_class }}
@@ -156,7 +177,7 @@ runs:
       if: inputs.schema_module != ''
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
+        IMAGE: ${{ steps.normalize.outputs.image }}
         VERSION: ${{ inputs.version }}
         SCHEMA_MODULE: ${{ inputs.schema_module }}
         SCHEMA_CLASS: ${{ inputs.schema_class }}
@@ -203,7 +224,7 @@ runs:
       if: inputs.dry_run != 'true' && steps.emit_config.outputs.emitted == 'true'
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
+        IMAGE: ${{ steps.normalize.outputs.image }}
         VERSION: ${{ inputs.version }}
         SCHEMA_PATH: ${{ steps.emit_config.outputs.path }}
       run: |
@@ -218,7 +239,7 @@ runs:
       if: inputs.dry_run != 'true' && steps.emit_output.outputs.emitted == 'true'
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
+        IMAGE: ${{ steps.normalize.outputs.image }}
         VERSION: ${{ inputs.version }}
         SCHEMA_PATH: ${{ steps.emit_output.outputs.path }}
       run: |

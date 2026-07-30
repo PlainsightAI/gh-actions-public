@@ -55,7 +55,7 @@ When `schema_module` is empty the composite is a no-op — unmigrated filters ca
 
 | Input           | Required | Default   | Description |
 |-----------------|----------|-----------|-------------|
-| `image`         | yes      |           | Full image path including registry and repository, *without* a tag. Must already be locally available (single-platform `load: true` build) or pullable from the registry (multi-platform `push: true` build), since emit-schema executes via `docker run --entrypoint python "${image}:${version}"`. |
+| `image`         | yes      |           | Image path, excluding the tag. Bare references (e.g., plainsightai/openfilter-sam3-detector) are automatically normalized to docker.io/. Must already be locally available (single-platform `load: true` build) or pullable from the registry (multi-platform `push: true` build), since emit-schema executes via `docker run --entrypoint python "${image}:${version}"`. |
 | `version`       | yes      |           | Image tag the schemas should attach to. Schemas are attached as OCI referrers with `subject: ${image}:${version}`. |
 | `dry_run`       | no       | `'false'` | When `'true'`, schemas are emitted but not attached. Whether a PR-time dry-run-publish job exists to exercise this is the caller's choice — opt-in per workflow, not part of the composite's contract. |
 | `schema_module` | no       | `''`      | Importable Python module path of the filter (e.g. `filter_sam3_detector.filter`). When set, emits the config schema (and, when declared, the output schema) via `python -m openfilter.cli emit-schema` inside the image, and attaches each as an OCI referrer. When unset, the composite is a no-op — back-compat for unmigrated filters. |
