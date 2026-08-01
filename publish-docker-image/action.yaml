@@ -102,14 +102,15 @@ runs:
           echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
         fi
         # Validate each ref up front so an unusable one fails HERE, naming the ref, rather
-        # than as an opaque syft parse error after the image is already pushed. The name
-        # segment (after the last '/') must be `name[:tag]`; a second colon means IMAGE
+        # than as an opaque syft parse error after the image is already pushed. Strip any
+        # @digest first (name:tag@sha256:... is a valid pinned reference), then the name
+        # segment (after the last '/') must be `name[:tag]`; a second colon there means IMAGE
         # already embedded a tag (ref resolves to `name:tag:version`), which syft rejects.
         while IFS= read -r ref; do
           [ -n "${ref//[[:space:]]/}" ] || continue
-          seg="${ref##*/}"; colons="${seg//[^:]/}"
+          seg="${ref##*/}"; seg="${seg%%@*}"; colons="${seg//[^:]/}"
           if [ "${#colons}" -gt 1 ]; then
-            echo "::error::SBOM attestation: resolved ref '$ref' is not a valid image reference (name segment '$seg' has ${#colons} colons). Fix 'make print-image-refs' / the IMAGE variable to emit 'registry/repo:tag' — IMAGE likely already carries a tag."
+            echo "::error::SBOM attestation: resolved ref '$ref' is not a valid image reference (name segment '${ref##*/}' has an extra colon). Fix 'make print-image-refs' / the IMAGE variable to emit 'registry/repo:tag' — IMAGE likely already carries a tag."
             exit 1
           fi
         done <<< "$refs"
@@ -144,6 +145,10 @@ runs:
         # attest_tlog=false skips the public transparency-log upload (keyless signing is
         # unchanged) for callers that must not record an image's ref/SBOM in a public log.
         tlog_flag=(); [ "$ATTEST_TLOG" = "false" ] && tlog_flag=(--tlog-upload=false)
+        # This wraps `make publish-image` and does not know the built platforms, so it
+        # catalogs one SBOM per ref — the host platform of a manifest-list. It assumes
+        # single-platform images (see the README); a multi-arch image would attest only one
+        # architecture. syft catalogs the image at $ref.
         while IFS= read -r ref; do
           [ -n "${ref//[[:space:]]/}" ] || continue
           echo "Attesting SBOM for $ref"
