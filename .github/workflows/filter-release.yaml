@@ -575,11 +575,16 @@ jobs:
       # identity — the load-bearing exception to the always-latest convention: pin
       # both by commit SHA. cosign-release pins the cosign binary (v2 flag spelling);
       # syft-version pins the SBOM generator so its output can't drift silently.
+      # continue-on-error like the attest step: these are plain release-asset downloads that
+      # run after the image + wheel are published, so a network blip fetching cosign/syft must
+      # not fail the release path (which would withhold the cascade / docs sync).
       - name: Install cosign
+        continue-on-error: true
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
           cosign-release: v2.5.2
       - name: Install syft
+        continue-on-error: true
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           syft-version: v1.50.0

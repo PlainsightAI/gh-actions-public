@@ -124,18 +124,25 @@ runs:
     # mutable tag could mint a Fulcio cert as the caller's identity — pin by commit SHA
     # (the load-bearing exception to floating tags). cosign-release pins the cosign binary;
     # syft-version pins the SBOM generator. Skipped when there is nothing to attest.
+    # continue-on-error: these and the attest below run AFTER `make publish-image` has pushed,
+    # so a release-asset download or signing outage must not fail the caller's publish job over
+    # an image that is already live. (The Resolve step above is NOT continue-on-error — a bad
+    # ref is a real error worth failing on, and nothing is pushed yet at that point.)
     - name: Install cosign
       if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
       uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       with:
         cosign-release: v2.5.2
     - name: Install syft
       if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
       uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       with:
         syft-version: v1.50.0
     - name: SBOM + keyless attest
       if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
       shell: bash
       env:
         ATTEST_TLOG: ${{ inputs.attest_tlog }}
