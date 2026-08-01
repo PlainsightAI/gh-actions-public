@@ -450,6 +450,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [create-release, prepare-pypi-publish, publish-to-pypi]
     if: needs.create-release.outputs.is_release_created == 'true' && (needs.publish-to-pypi.result == 'success' || needs.publish-to-pypi.result == 'skipped')
+    # id-token: write lets the keyless cosign SBOM attestation steps below mint a
+    # short-lived OIDC identity token instead of using a long-lived signing key.
+    # NOTE: the caller (each filter's create-release.yaml) must also grant
+    # `id-token: write`, since a reusable workflow's permissions are capped by the
+    # caller's.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -536,6 +544,49 @@ jobs:
           version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
           schema_module: ${{ inputs.schema_module }}
           schema_class: ${{ inputs.schema_class }}
+
+      # ----- Supply-chain: SBOM + signed attestation --------------------------
+      # Runs LAST (after the schema attach), so an attest/Sigstore failure — the
+      # newest, most-likely-to-flake step — cannot stop the older, independently
+      # useful schema-attach from completing. Generate an SPDX SBOM and attach it
+      # as a keyless, signed in-toto attestation (Sigstore, via the job's GitHub
+      # OIDC token — no long-lived key). Public images log to the Rekor
+      # transparency log normally. The grype-release-metric daily scanner reads
+      # just this attestation (KBs) to re-scan the released image without pulling
+      # it. These two run in a job holding id-token: write and cosign signs, so a
+      # compromised mutable tag on either could mint a Fulcio cert as this repo's
+      # identity — the load-bearing exception to the always-latest convention: pin
+      # both by commit SHA. cosign-release pins the cosign binary (v2 flag spelling);
+      # syft-version pins the SBOM generator so its output can't drift silently.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v2.5.2
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+      - name: SBOM + keyless attest
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.docker_image }}
+          VERSION: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${VERSION}"
+          # syft against a manifest-list tag only catalogs one platform, so
+          # multi-arch images need one SBOM per target platform. Each is attested
+          # to the same (index) digest; the scanner reads every spdxjson attestation.
+          IFS=',' read -ra PLATS <<< "${PLATFORMS}"
+          for plat in "${PLATS[@]}"; do
+            plat="$(echo "$plat" | tr -d '[:space:]')"
+            [ -n "$plat" ] || continue
+            sbom="sbom.$(echo "$plat" | tr '/' '-').spdx.json"
+            syft "${REF}" --platform "${plat}" -o spdx-json="${sbom}"
+            # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
+            cosign attest --yes --type spdxjson --predicate "${sbom}" "${REF}"
+          done
 
   # Probe whether the cascade can run before invoking the called
   # workflow — GitHub Actions has no first-class "is this secret set?"
