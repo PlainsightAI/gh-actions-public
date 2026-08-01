@@ -583,7 +583,13 @@ jobs:
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           syft-version: v1.50.0
+      # continue-on-error: a Sigstore/Fulcio flake here (the newest, most-likely-to-flake
+      # step, after the image + wheel are already published) still shows red on the checks
+      # board but does not fail publish-docker, so cascade-gate and trigger-docs-sync — which
+      # gate on needs.publish-docker.result == 'success' — are not withheld by an attest
+      # outage. Ordering alone can't protect those downstream jobs; this can.
       - name: SBOM + keyless attest
+        continue-on-error: true
         shell: bash
         env:
           IMAGE: ${{ inputs.docker_image }}
