@@ -291,8 +291,11 @@ jobs:
       # Generate the SBOM against the locally-loaded image but do NOT attest (nothing is
       # pushed at PR time). This catches a syft invocation or reference problem here, at PR
       # time, instead of at the first real release — mirroring the emit-only schema step.
+      # SHA-pinned (same build as the release path): the "Forward inherited secrets to env"
+      # step earlier in this job writes the caller's inherited secrets into $GITHUB_ENV, so
+      # they are visible to every later step here, including this one.
       - name: Install syft
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           syft-version: v1.50.0
       - name: SBOM (dry-run; no attest)
