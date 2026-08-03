@@ -468,16 +468,25 @@ jobs:
     needs: [create-release, prepare-pypi-publish, publish-to-pypi]
     if: needs.create-release.outputs.is_release_created == 'true' && (needs.publish-to-pypi.result == 'success' || needs.publish-to-pypi.result == 'skipped')
     # id-token: write lets the keyless cosign SBOM attestation steps below mint a
-    # short-lived OIDC identity token instead of using a long-lived signing key.
-    # NOTE: the caller (each filter's create-release.yaml) must also grant
-    # `id-token: write`, since a reusable workflow's permissions are capped by the
-    # caller's.
+    # short-lived OIDC identity token instead of using a long-lived signing key. This
+    # block on the reusable workflow is sufficient on its own — callers need not grant
+    # id-token. The sibling security-scan.yaml uses the same pattern (its own
+    # `id-token: write`) and its filter callers, which declare no `permissions:` block at
+    # all, mint OIDC fine (google-github-actions/auth). The only way a caller would break
+    # this is by setting its OWN restrictive `permissions:` block without id-token, which
+    # the filter create-release.yaml callers do not do.
     permissions:
       contents: read
       id-token: write
+    # Third-party actions in this job are pinned by commit SHA, not a floating tag: the job
+    # holds id-token: write, so its OIDC token is in every step's environment, and a
+    # compromised mutable tag on any of them could mint a Fulcio cert as this repo. Same
+    # reasoning the cosign/syft installers are already SHA-pinned. (attach-filter-schemas
+    # stays @main below — it is this repo's own action, so pinning it guards against nothing
+    # a push to this repo couldn't already do, and would add a self-referential SHA treadmill.)
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: "PreAction Disk-Cleanup"
         run: |
@@ -486,10 +495,10 @@ jobs:
           sudo docker builder prune -a --force || true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ inputs.dockerhub_username }}
           password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
@@ -520,7 +529,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ inputs.docker_image }}
           tags: |
@@ -535,7 +544,7 @@ jobs:
         run: echo "${{ github.sha }}" > GITHUB_SHA
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile

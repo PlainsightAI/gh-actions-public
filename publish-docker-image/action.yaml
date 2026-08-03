@@ -158,7 +158,15 @@ runs:
         set -euo pipefail
         # attest_tlog=false skips the public transparency-log upload (keyless signing is
         # unchanged) for callers that must not record an image's ref/SBOM in a public log.
-        tlog_flag=(); [ "$ATTEST_TLOG" = "false" ] && tlog_flag=(--tlog-upload=false)
+        # But Rekor is also cosign's trusted timestamp: without it, the ~10-minute Fulcio cert
+        # can't be proven valid at signing time, so a verifier rejects the attestation on
+        # expiry. When skipping the log, attach an RFC3161 signed timestamp from the Sigstore
+        # public TSA instead — a verifier checks it with --use-signed-timestamps against the
+        # Sigstore trusted root (no cert-chain file). tlog=true (default) keeps the Rekor path.
+        tlog_flag=()
+        if [ "$ATTEST_TLOG" = "false" ]; then
+          tlog_flag=(--tlog-upload=false --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp)
+        fi
         # This wraps `make publish-image` and does not know the built platforms, so it
         # catalogs one SBOM per ref — the host platform of a manifest-list. It assumes
         # single-platform images (see the README); a multi-arch image would attest only one
