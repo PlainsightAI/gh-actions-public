@@ -9,7 +9,7 @@ Builds and publishes a Docker image to Google Artifact Registry (GAR). This acti
 | `version`    | Override the version in the `VERSION` file                                  | ❌        | `""`          |
 | `image`      | Override the default Docker image path (e.g., `gcr.io/...`)                 | ❌        | `""`          |
 | `environment`| Environment for GCP Workload Identity (`production`, `staging`, `development`) | ❌    | `"production"`|
-| `attest_tlog`| Upload the SBOM attestation to the public Rekor transparency log. `'false'` skips the public log for images whose reference/SBOM must not be recorded publicly (keyless signing is unaffected). | ❌ | `"true"` |
+| `attest_tlog`| Upload the SBOM attestation to the public Rekor transparency log. Defaults to `'false'` because this action is GAR-only — every ref it attests is a private Artifact Registry coordinate that should not land in a public log; on `'false'` the attestation carries an RFC3161 signed timestamp instead so it stays verifiable. Set `'true'` only for a genuinely public image. | ❌ | `"false"` |
 
 ## Prerequisites
 
@@ -43,6 +43,26 @@ It is **opt-in and non-breaking** — it no-ops with a warning unless the caller
 
 The action **assumes single-platform images** — it wraps `make publish-image` and does not know
 the built platforms, so a multi-arch image would have only one architecture cataloged.
+
+### Verifying the attestation
+
+The verify command depends on `attest_tlog`:
+
+```bash
+# attest_tlog=false (the default — RFC3161 signed timestamp, no Rekor entry): BOTH flags.
+# --insecure-ignore-tlog skips the Rekor lookup for an entry that deliberately does not exist;
+# --use-signed-timestamps supplies trusted time from the stamp so the short-lived Fulcio cert
+# is proven valid at signing time. --use-signed-timestamps alone fails "signature not found in
+# transparency log".
+cosign verify-attestation --type spdxjson --insecure-ignore-tlog --use-signed-timestamps \
+  --certificate-identity-regexp '<your signer identity>' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com <image-ref>
+
+# attest_tlog=true (public image, Rekor entry): neither flag.
+cosign verify-attestation --type spdxjson \
+  --certificate-identity-regexp '<your signer identity>' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com <image-ref>
+```
 
 ## Usage
 

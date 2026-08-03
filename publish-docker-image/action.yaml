@@ -21,12 +21,16 @@ inputs:
   attest_tlog:
     description: >
       Whether the SBOM attestation is uploaded to the public Rekor transparency
-      log. Default 'true' keeps published images publicly verifiable. Set 'false'
-      to skip the public log for images whose reference and SBOM should not be
-      recorded in a public, permanent, append-only log. Keyless signing is
-      unaffected either way; only the transparency-log upload is skipped.
+      log. Default 'false' because this composite is GAR-only (it authenticates
+      with `gcloud auth configure-docker …pkg.dev`), so every ref it attests is a
+      private Artifact Registry coordinate that should not have its path + full
+      SPDX recorded in a public, permanent, append-only log. On 'false' the
+      attestation instead carries an RFC3161 signed timestamp (Sigstore public
+      TSA) so it stays verifiable. Set 'true' only for a genuinely public image
+      (then Rekor provides the timestamp). Keyless signing is unaffected either
+      way; only the transparency-log upload changes.
     required: false
-    default: 'true'
+    default: 'false'
 
 runs:
   using: "composite"
@@ -156,13 +160,18 @@ runs:
         REFS: ${{ steps.resolve.outputs.refs }}
       run: |
         set -euo pipefail
-        # attest_tlog=false skips the public transparency-log upload (keyless signing is
-        # unchanged) for callers that must not record an image's ref/SBOM in a public log.
-        # But Rekor is also cosign's trusted timestamp: without it, the ~10-minute Fulcio cert
-        # can't be proven valid at signing time, so a verifier rejects the attestation on
-        # expiry. When skipping the log, attach an RFC3161 signed timestamp from the Sigstore
-        # public TSA instead — a verifier checks it with --use-signed-timestamps against the
-        # Sigstore trusted root (no cert-chain file). tlog=true (default) keeps the Rekor path.
+        # attest_tlog=false (the default here — see the input) skips the public transparency-log
+        # upload so a private GAR ref + its SBOM aren't recorded in a public log. But Rekor is
+        # also cosign's trusted timestamp: without it, the ~10-minute Fulcio cert can't be proven
+        # valid at signing time, so a verifier rejects the attestation on expiry. So when skipping
+        # the log we attach an RFC3161 signed timestamp from the Sigstore public TSA. To VERIFY
+        # such an attestation the verifier needs BOTH flags together:
+        #     cosign verify-attestation --insecure-ignore-tlog --use-signed-timestamps …
+        # --insecure-ignore-tlog skips the Rekor lookup for an entry that deliberately does not
+        # exist; --use-signed-timestamps then supplies trusted time from the RFC3161 stamp.
+        # --use-signed-timestamps ALONE is not enough — cosign still requires a Rekor entry and
+        # fails "signature not found in transparency log". attest_tlog=true (public images) keeps
+        # the Rekor path and verifies with neither flag.
         tlog_flag=()
         if [ "$ATTEST_TLOG" = "false" ]; then
           tlog_flag=(--tlog-upload=false --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp)
