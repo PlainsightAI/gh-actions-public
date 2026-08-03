@@ -176,6 +176,23 @@ runs:
         if [ "$ATTEST_TLOG" = "false" ]; then
           tlog_flag=(--tlog-upload=false --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp)
         fi
+        # Bounded retry around cosign attest. On attest_tlog=false, cosign's TSA client is a
+        # single request with a 10s timeout and no retry, so a transient timestamp.sigstore.dev
+        # blip would otherwise fail attestation. Safe to retry: the TSA timestamp is fetched
+        # during signing, before the attestation is pushed, so a failure leaves nothing behind,
+        # and the scanner dedupes so a duplicate from a late-failure retry is harmless. Backoff
+        # 5,10,20,40s; a genuine non-transient error still fails after exhausting the budget.
+        attest_with_retry() {
+          local n=0 max=5 delay=5
+          until cosign attest --yes "${tlog_flag[@]}" --type spdxjson --predicate sbom.spdx.json "$1"; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "::error::cosign attest failed after ${max} attempts for $1"; return 1
+            fi
+            echo "::warning::cosign attest failed (attempt ${n}/${max}) for $1 — retrying in ${delay}s"
+            sleep "$delay"; delay=$((delay * 2))
+          done
+        }
         # This wraps `make publish-image` and does not know the built platforms, so it
         # catalogs one SBOM per ref — the host platform of a manifest-list. It assumes
         # single-platform images (see the README); a multi-arch image would attest only one
@@ -185,7 +202,7 @@ runs:
           echo "Attesting SBOM for $ref"
           syft "$ref" -o spdx-json=sbom.spdx.json
           # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
-          cosign attest --yes "${tlog_flag[@]}" --type spdxjson --predicate sbom.spdx.json "$ref"
+          attest_with_retry "$ref"
         done <<< "$REFS"
     # The three steps above are continue-on-error so an already-pushed image never fails the
     # publish job — but a green job that shipped an UNATTESTED image must not look identical to
