@@ -45,6 +45,60 @@ runs:
         echo "Overriding IMAGE with: ${{ inputs.image }}"
         echo "IMAGE=${{ inputs.image }}" >> $GITHUB_ENV
 
+    # ----- Supply-chain: SBOM + signed attestation (opt-in) -----------------
+    # Generate an SPDX SBOM after the push and attach it as a keyless, signed in-toto
+    # attestation (Sigstore, via the job's GitHub OIDC token — no long-lived key), so a
+    # scanner can re-check the released image from its SBOM without pulling it.
+    #
+    # This step only VALIDATES what will be attested (id-token present? refs resolvable?),
+    # so it runs BEFORE build/push: a bad ref (e.g. IMAGE already carries a tag, resolving to
+    # `name:tag:version`) then fails fast with nothing published yet, instead of failing the
+    # publish job over an image that is already live. The actual signing runs after the push.
+    #
+    # Opt-in and non-breaking: if the caller granted no id-token, or exposes no ref, this warns
+    # and skips — and the installs/attest below skip too. A repo enables coverage by granting
+    # `permissions: id-token: write` AND exposing its pushed ref(s): a `print-image-refs` make
+    # target (newline-separated, for repos that push more than one image) or IMAGE + VERSION.
+    - name: Resolve SBOM attest refs
+      id: resolve
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::warning::SBOM attestation skipped: caller job has no 'id-token: write'. Add it (and a print-image-refs target or IMAGE/VERSION env) to enable keyless cosign attestation."
+          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        refs=""
+        if make -n print-image-refs >/dev/null 2>&1; then
+          refs="$(make -s print-image-refs)"
+        elif [ -n "${IMAGE:-}" ] && [ -n "${VERSION:-}" ]; then
+          refs="${IMAGE}:${VERSION}"
+        fi
+        if [ -z "${refs//[[:space:]]/}" ]; then
+          echo "::warning::SBOM attestation skipped: could not determine the pushed image ref (add a 'print-image-refs' make target or set IMAGE and VERSION in the job env)."
+          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        # Validate each ref up front so an unusable one fails HERE, before anything is pushed,
+        # rather than as an opaque syft parse error after the image is already live. Strip any
+        # @digest first (name:tag@sha256:... is a valid pinned reference), then the name
+        # segment (after the last '/') must be `name[:tag]`; a second colon there means IMAGE
+        # already embedded a tag (ref resolves to `name:tag:version`), which syft rejects.
+        while IFS= read -r ref; do
+          [ -n "${ref//[[:space:]]/}" ] || continue
+          seg="${ref##*/}"; seg="${seg%%@*}"; colons="${seg//[^:]/}"
+          if [ "${#colons}" -gt 1 ]; then
+            echo "::error::SBOM attestation: resolved ref '$ref' is not a valid image reference (name segment '${ref##*/}' has an extra colon). Fix 'make print-image-refs' / the IMAGE variable to emit 'registry/repo:tag' — IMAGE likely already carries a tag."
+            exit 1
+          fi
+        done <<< "$refs"
+        {
+          echo "attest=true"
+          echo "refs<<__REFS_EOF__"
+          echo "$refs"
+          echo "__REFS_EOF__"
+        } >> "$GITHUB_OUTPUT"
+
     # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
     - name: Authenticate to Google Cloud
       uses: PlainsightAI/gh-actions-public/google-cloud-auth@main
@@ -71,63 +125,15 @@ runs:
       run: |
         make publish-image
 
-    # ----- Supply-chain: SBOM + signed attestation (opt-in) -----------------
-    # Generate an SPDX SBOM and attach it as a keyless, signed in-toto attestation
-    # (Sigstore, via the job's GitHub OIDC token — no long-lived key), so a scanner
-    # can re-check the released image from its SBOM without pulling it.
-    #
-    # Opt-in and non-breaking: resolve the ref(s) first; if the caller granted no
-    # id-token, or exposes no ref, this warns and skips — and the installs below skip
-    # too. A repo enables coverage by granting `permissions: id-token: write` AND exposing
-    # its pushed ref(s): a `print-image-refs` make target (newline-separated, for repos
-    # that push more than one image) or IMAGE + VERSION in the job env.
-    - name: Resolve SBOM attest refs
-      id: resolve
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        set -euo pipefail
-        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-          echo "::warning::SBOM attestation skipped: caller job has no 'id-token: write'. Add it (and a print-image-refs target or IMAGE/VERSION env) to enable keyless cosign attestation."
-          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
-        fi
-        refs=""
-        if make -n print-image-refs >/dev/null 2>&1; then
-          refs="$(make -s print-image-refs)"
-        elif [ -n "${IMAGE:-}" ] && [ -n "${VERSION:-}" ]; then
-          refs="${IMAGE}:${VERSION}"
-        fi
-        if [ -z "${refs//[[:space:]]/}" ]; then
-          echo "::warning::SBOM attestation skipped: could not determine the pushed image ref (add a 'print-image-refs' make target or set IMAGE and VERSION in the job env)."
-          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
-        fi
-        # Validate each ref up front so an unusable one fails HERE, naming the ref, rather
-        # than as an opaque syft parse error after the image is already pushed. Strip any
-        # @digest first (name:tag@sha256:... is a valid pinned reference), then the name
-        # segment (after the last '/') must be `name[:tag]`; a second colon there means IMAGE
-        # already embedded a tag (ref resolves to `name:tag:version`), which syft rejects.
-        while IFS= read -r ref; do
-          [ -n "${ref//[[:space:]]/}" ] || continue
-          seg="${ref##*/}"; seg="${seg%%@*}"; colons="${seg//[^:]/}"
-          if [ "${#colons}" -gt 1 ]; then
-            echo "::error::SBOM attestation: resolved ref '$ref' is not a valid image reference (name segment '${ref##*/}' has an extra colon). Fix 'make print-image-refs' / the IMAGE variable to emit 'registry/repo:tag' — IMAGE likely already carries a tag."
-            exit 1
-          fi
-        done <<< "$refs"
-        {
-          echo "attest=true"
-          echo "refs<<__REFS_EOF__"
-          echo "$refs"
-          echo "__REFS_EOF__"
-        } >> "$GITHUB_OUTPUT"
-    # These two run in a job holding id-token: write and cosign signs, so a compromised
-    # mutable tag could mint a Fulcio cert as the caller's identity — pin by commit SHA
-    # (the load-bearing exception to floating tags). cosign-release pins the cosign binary;
-    # syft-version pins the SBOM generator. Skipped when there is nothing to attest.
-    # continue-on-error: these and the attest below run AFTER `make publish-image` has pushed,
-    # so a release-asset download or signing outage must not fail the caller's publish job over
-    # an image that is already live. (The Resolve step above is NOT continue-on-error — a bad
-    # ref is a real error worth failing on, and nothing is pushed yet at that point.)
+    # ----- Supply-chain: SBOM + signed attestation, continued --------------
+    # These run AFTER the push, in a job holding id-token: write, and cosign signs — so a
+    # compromised mutable tag could mint a Fulcio cert as the caller's identity. Pin by commit
+    # SHA (the load-bearing exception to floating tags): cosign-release pins the cosign binary;
+    # syft-version pins the SBOM generator. Skipped when Resolve found nothing to attest.
+    # continue-on-error: a release-asset download or signing outage must not fail the caller's
+    # publish job over an image that is already live. (Resolve, above, IS allowed to fail — it
+    # runs before build/push, so a bad ref costs nothing.) A soft failure here is not silent:
+    # the "Record SBOM attestation outcome" step below annotates the run and the job summary.
     - name: Install cosign
       if: steps.resolve.outputs.attest == 'true'
       continue-on-error: true
@@ -141,6 +147,7 @@ runs:
       with:
         syft-version: v1.50.0
     - name: SBOM + keyless attest
+      id: attest
       if: steps.resolve.outputs.attest == 'true'
       continue-on-error: true
       shell: bash
@@ -163,3 +170,22 @@ runs:
           # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
           cosign attest --yes "${tlog_flag[@]}" --type spdxjson --predicate sbom.spdx.json "$ref"
         done <<< "$REFS"
+    # The three steps above are continue-on-error so an already-pushed image never fails the
+    # publish job — but a green job that shipped an UNATTESTED image must not look identical to
+    # one that attested. Read the attest step's outcome and, when it isn't success, emit a
+    # ::warning:: (annotates the run) plus a job-summary line, so the gap is visible without
+    # blocking the publish. `if: always()` so it runs even though a prior step "failed".
+    - name: Record SBOM attestation outcome
+      if: always() && steps.resolve.outputs.attest == 'true'
+      shell: bash
+      env:
+        ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+        REFS: ${{ steps.resolve.outputs.refs }}
+      run: |
+        set -euo pipefail
+        if [ "$ATTEST_OUTCOME" = "success" ]; then
+          echo "✅ SBOM attestation attached for: ${REFS//$'\n'/, }" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "::warning::SBOM attestation did NOT complete (step outcome: ${ATTEST_OUTCOME:-skipped}); the image was published WITHOUT a signed SBOM attestation. See the 'SBOM + keyless attest' step log."
+          echo "⚠️ SBOM attestation FAILED (outcome: ${ATTEST_OUTCOME:-skipped}) — image published WITHOUT a signed SBOM: ${REFS//$'\n'/, }" >> "$GITHUB_STEP_SUMMARY"
+        fi
