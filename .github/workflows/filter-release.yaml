@@ -254,6 +254,14 @@ jobs:
             { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
           done
 
+      # The build context is this checkout, so write the build commit here and
+      # the standard Dockerfile's `COPY . .` picks it up; the Dockerfile renames
+      # GITHUB_SHA -> VERSION_SHA, which openfilter reads as the version_sha
+      # lineage facet. Private/premium write this in their build job too; do it
+      # here so the public docker path behaves the same.
+      - name: Write Git SHA to GITHUB_SHA
+        run: echo "${{ github.sha }}" > GITHUB_SHA
+
       # Single-platform load build — image stays in the local daemon under a
       # local-only namespace (no production repo coordinates), so the
       # composite's `docker run` resolves locally instead of pulling.
@@ -493,6 +501,13 @@ jobs:
           tags: |
             # Intentional dummy tag: we only consume labels from this action.
             type=raw,value=skip
+
+      # Write the build commit into this checkout (the build context) so the
+      # standard Dockerfile's `COPY . .` picks it up and its GITHUB_SHA ->
+      # VERSION_SHA rename feeds openfilter's version_sha lineage facet —
+      # matching the private/premium build jobs.
+      - name: Write Git SHA to GITHUB_SHA
+        run: echo "${{ github.sha }}" > GITHUB_SHA
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
