@@ -288,6 +288,34 @@ jobs:
           schema_module: ${{ inputs.schema_module }}
           schema_class: ${{ inputs.schema_class }}
 
+      # Generate the SBOM against the locally-loaded image but do NOT attest (nothing is
+      # pushed at PR time). This catches a syft invocation or reference problem here, at PR
+      # time, instead of at the first real release — mirroring the emit-only schema step.
+      # SHA-pinned (same build as the release path): the "Forward inherited secrets to env"
+      # step earlier in this job writes the caller's inherited secrets into $GITHUB_ENV, so
+      # they are visible to every later step here, including this one.
+      # continue-on-error: this job runs on every PR to main across the filter repos that call
+      # this workflow at @main, so a download-syft network blip must not redden their unrelated
+      # PRs. The release path treats the identical fetch as continue-on-error for the same reason.
+      - name: Install syft
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+      - name: SBOM (dry-run; no attest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Guard on syft actually being installed: with the install above continue-on-error, a
+          # blip skips this check with a warning rather than failing the PR, while a syft that
+          # DID install and then rejects the image still fails — the signal this step exists for.
+          if ! command -v syft >/dev/null; then
+            echo "::warning::syft not installed (download blip) — skipping dry-run SBOM check"
+            exit 0
+          fi
+          syft "localhost/filter:pr-${{ github.event.number }}" -o spdx-json=sbom.spdx.json
+          test -s sbom.spdx.json
+
   create-release:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -450,9 +478,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: [create-release, prepare-pypi-publish, publish-to-pypi]
     if: needs.create-release.outputs.is_release_created == 'true' && (needs.publish-to-pypi.result == 'success' || needs.publish-to-pypi.result == 'skipped')
+    # id-token: write lets the keyless cosign SBOM attestation steps below mint a
+    # short-lived OIDC identity token instead of using a long-lived signing key. This
+    # block on the reusable workflow is sufficient on its own — callers need not grant
+    # id-token. The sibling security-scan.yaml uses the same pattern (its own
+    # `id-token: write`) and its filter callers, which declare no `permissions:` block at
+    # all, mint OIDC fine (google-github-actions/auth). The only way a caller would break
+    # this is by setting its OWN restrictive `permissions:` block without id-token, which
+    # the filter create-release.yaml callers do not do.
+    permissions:
+      contents: read
+      id-token: write
+    # Third-party actions in this job are pinned by commit SHA, not a floating tag: the job
+    # holds id-token: write, so its OIDC token is in every step's environment, and a
+    # compromised mutable tag on any of them could mint a Fulcio cert as this repo. Same
+    # reasoning the cosign/syft installers are already SHA-pinned. (attach-filter-schemas
+    # stays @main below — it is this repo's own action, so pinning it guards against nothing
+    # a push to this repo couldn't already do, and would add a self-referential SHA treadmill.)
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: "PreAction Disk-Cleanup"
         run: |
@@ -461,10 +506,10 @@ jobs:
           sudo docker builder prune -a --force || true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ inputs.dockerhub_username }}
           password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_ACCESS_TOKEN }}
@@ -495,7 +540,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ inputs.docker_image }}
           tags: |
@@ -510,7 +555,7 @@ jobs:
         run: echo "${{ github.sha }}" > GITHUB_SHA
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile
@@ -536,6 +581,100 @@ jobs:
           version: ${{ needs.prepare-pypi-publish.outputs.package_version }}
           schema_module: ${{ inputs.schema_module }}
           schema_class: ${{ inputs.schema_class }}
+
+      # ----- Supply-chain: SBOM + signed attestation --------------------------
+      # Runs LAST (after the schema attach), so an attest/Sigstore failure — the
+      # newest, most-likely-to-flake step — cannot stop the older, independently
+      # useful schema-attach from completing. Generate an SPDX SBOM and attach it
+      # as a keyless, signed in-toto attestation (Sigstore, via the job's GitHub
+      # OIDC token — no long-lived key). Public images log to the Rekor
+      # transparency log normally. The grype-release-metric daily scanner reads
+      # just this attestation (KBs) to re-scan the released image without pulling
+      # it. These two run in a job holding id-token: write and cosign signs, so a
+      # compromised mutable tag on either could mint a Fulcio cert as this repo's
+      # identity — the load-bearing exception to the always-latest convention: pin
+      # both by commit SHA. cosign-release pins the cosign binary (v2 flag spelling);
+      # syft-version pins the SBOM generator so its output can't drift silently.
+      # continue-on-error like the attest step: these are plain release-asset downloads that
+      # run after the image + wheel are published, so a network blip fetching cosign/syft must
+      # not fail the release path (which would withhold the cascade / docs sync).
+      - name: Install cosign
+        continue-on-error: true
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v2.5.2
+      - name: Install syft
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+      # continue-on-error: a Sigstore/Fulcio flake here (the newest, most-likely-to-flake step,
+      # after the image + wheel are already published) does not fail publish-docker, so
+      # cascade-gate and trigger-docs-sync — which gate on needs.publish-docker.result ==
+      # 'success' — are not withheld by an attest outage. Ordering alone can't protect those
+      # downstream jobs; this can. The trade-off is that continue-on-error makes the JOB green
+      # even when this step failed (it does NOT show red on the checks board), so the "Record
+      # SBOM attestation outcome" step below reads steps.attest.outcome and emits a ::warning::
+      # + job-summary line when it isn't success — otherwise a release that shipped an
+      # unattested image would look identical to one that attested.
+      - name: SBOM + keyless attest
+        id: attest
+        continue-on-error: true
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.docker_image }}
+          VERSION: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${VERSION}"
+          # Bounded retry around cosign attest. This is the Rekor path (public images), but
+          # Fulcio and Rekor can both flake, and this step is continue-on-error, so a flake
+          # would otherwise ship a public release with no attestation behind a warning nobody
+          # reads. Same shape/reasoning as the composite's attest_with_retry; backoff 5/10/20/40s,
+          # a genuine error still fails after the budget.
+          attest_with_retry() {
+            local n=0 max=5 delay=5
+            until cosign attest --yes --type spdxjson --predicate "$1" "$2"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then echo "::error::cosign attest failed after ${max} attempts for $2"; return 1; fi
+              echo "::warning::cosign attest failed (attempt ${n}/${max}) for $2 — retrying in ${delay}s"
+              sleep "$delay"; delay=$((delay * 2))
+            done
+          }
+          # syft against a manifest-list tag only catalogs one platform, so
+          # multi-arch images need one SBOM per target platform. Each is attested
+          # to the same (index) digest; the scanner reads every spdxjson attestation.
+          IFS=',' read -ra PLATS <<< "${PLATFORMS}"
+          for plat in "${PLATS[@]}"; do
+            plat="$(echo "$plat" | tr -d '[:space:]')"
+            [ -n "$plat" ] || continue
+            sbom="sbom.$(echo "$plat" | tr '/' '-').spdx.json"
+            syft "${REF}" --platform "${plat}" -o spdx-json="${sbom}"
+            # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
+            attest_with_retry "${sbom}" "${REF}"
+          done
+      # Because the attest step is continue-on-error, a green publish-docker job could have
+      # shipped an image with no (or, since `set -euo pipefail` aborts the loop mid-way, only
+      # partial) SBOM attestation. Surface that: read the step outcome and, when it isn't
+      # success, annotate the run (::warning::) and the job summary so an unattested release is
+      # distinguishable from an attested one without re-failing the publish. `if: always()` so
+      # it runs even after the "failed" step.
+      - name: Record SBOM attestation outcome
+        if: always()
+        shell: bash
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          IMAGE: ${{ inputs.docker_image }}
+          VERSION: ${{ needs.prepare-pypi-publish.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          if [ "$ATTEST_OUTCOME" = "success" ]; then
+            echo "✅ SBOM attestation attached for ${IMAGE}:${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::SBOM attestation did NOT complete (step outcome: ${ATTEST_OUTCOME:-skipped}); ${IMAGE}:${VERSION} was published WITHOUT a complete signed SBOM attestation. See the 'SBOM + keyless attest' step log."
+            echo "⚠️ SBOM attestation FAILED (outcome: ${ATTEST_OUTCOME:-skipped}) — ${IMAGE}:${VERSION} published WITHOUT a complete signed SBOM." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Probe whether the cascade can run before invoking the called
   # workflow — GitHub Actions has no first-class "is this secret set?"

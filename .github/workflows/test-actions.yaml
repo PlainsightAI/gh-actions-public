@@ -1,0 +1,148 @@
+name: Test composite actions
+
+# Self-test for this actions library's own PRs. The other workflows here are all
+# `workflow_call` reusables consumed by filter repos; this one runs on pushes/PRs to
+# gh-actions-public itself so the SBOM attest + verify + retry mechanics that the public
+# publish paths rely on (publish-docker-image composite and the filter-release.yaml attest)
+# are exercised end to end — before, nothing in this repo ran them, so a break only surfaced
+# at a real release.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # Exercises the SBOM attest/verify/retry logic end to end against a throwaway multi-arch
+  # image in a LOCAL registry — no GAR, no real Rekor. Both public attest sites use the same
+  # cosign flags this job runs (attest_tlog=false → RFC3161 timestamp; verify with the
+  # --insecure-ignore-tlog + --use-signed-timestamps pair; attest_with_retry). Mirrors the
+  # publish-gar-image-attest job in the sibling gh-actions repo.
+  publish-docker-image-attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # keyless cosign (Fulcio); tlog upload is skipped below
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      REF: localhost:5000/attest-test:v1
+      PLATFORMS: linux/amd64,linux/arm64
+      # syft/cosign must talk plain HTTP to the local registry.
+      SYFT_REGISTRY_INSECURE_USE_HTTP: "true"
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: network=host
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v2.5.2
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+      - name: Build and push a throwaway multi-arch image
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          printf 'FROM alpine:3.20\nRUN echo attest-test\n' > ctx/Dockerfile
+          docker buildx build --platform "$PLATFORMS" -t "$REF" --push ctx
+      - name: Attest via attest_with_retry (mirrors the public attest paths) and verify
+        run: |
+          set -euo pipefail
+          # Mirror the attest_with_retry the public paths use (publish-docker-image composite +
+          # filter-release.yaml). The composites can't run here (make/GAR-based, or Rekor upload),
+          # so the wrapper is copied with the test's flags: --tlog-upload=false keeps test runs
+          # out of the public log, --timestamp-server-url attaches the RFC3161 stamp that replaces
+          # Rekor as trusted time, --allow-http-registry targets the local registry.
+          attest_with_retry() {
+            local n=0 max=5 delay=5
+            until cosign attest --yes --tlog-upload=false \
+                    --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp \
+                    --allow-http-registry --type spdxjson --predicate "$1" "$2"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then echo "::error::cosign attest failed after ${max} attempts for $2"; return 1; fi
+              echo "::warning::cosign attest failed (attempt ${n}/${max}) for $2 — retrying in ${delay}s"
+              sleep "$delay"; delay=$((delay * 2))
+            done
+          }
+          IFS=',' read -ra PLATS <<< "$PLATFORMS"
+          for plat in "${PLATS[@]}"; do
+            sbom="sbom.$(echo "$plat" | tr '/' '-').spdx.json"
+            syft "$REF" --platform "$plat" -o spdx-json="$sbom"
+            attest_with_retry "$sbom" "$REF"
+          done
+          # Both per-platform attestations must land on the one index digest.
+          n="$(cosign download attestation --allow-http-registry \
+                 --predicate-type=https://spdx.dev/Document "$REF" \
+               | jq -s '[.[] | .payload | @base64d | fromjson
+                        | select(.predicateType=="https://spdx.dev/Document")] | length')"
+          echo "attestations attached: $n"
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 per-platform attestations, got $n"; exit 1; }
+          # Counting alone is not enough: if --platform stopped taking effect, syft would write
+          # two SBOMs of the runner's architecture and both would still attest (n=2). Assert each
+          # SBOM actually describes its own platform.
+          grep -q 'x86_64' sbom.linux-amd64.spdx.json \
+            || { echo "::error::amd64 SBOM has no x86_64 packages — the per-platform split did not apply"; exit 1; }
+          grep -q 'aarch64' sbom.linux-arm64.spdx.json \
+            || { echo "::error::arm64 SBOM has no aarch64 packages — the per-platform split did not apply"; exit 1; }
+          # VERIFY (not just download): for a tlog=false image the two flags are BOTH required.
+          # --insecure-ignore-tlog skips the Rekor lookup (no entry — the point of tlog=false),
+          # and --use-signed-timestamps supplies trusted time from the RFC3161 stamp so the
+          # ~10-min Fulcio cert is proven valid at signing time. --use-signed-timestamps alone
+          # still hits Rekor and fails "signature not found in transparency log". Identity: this
+          # test workflow on any ref (no production ref anchor).
+          cosign verify-attestation --type spdxjson --allow-http-registry \
+            --insecure-ignore-tlog --use-signed-timestamps \
+            --certificate-identity-regexp "^https://github\.com/PlainsightAI/gh-actions-public/\.github/workflows/test-actions\.yaml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REF" > /dev/null \
+            && echo "verify-attestation with signed timestamp: OK" \
+            || { echo "::error::verify-attestation (tlog=false + signed timestamp) failed"; exit 1; }
+          # The verify runs seconds after the cert is minted, so it stays green even WITHOUT a
+          # timestamp (cosign falls back to CheckExpiry against now, which passes on a fresh
+          # cert). To make it a real regression test, assert the timestamp is actually attached:
+          # cosign stores it as the OCI layer annotation dev.sigstore.cosign/rfc3161timestamp on
+          # the .att manifest (one per platform, so 2), absent without --timestamp-server-url.
+          att="$(cosign triangulate --allow-http-registry --type attestation "$REF")"
+          curl -s "http://localhost:5000/v2/attest-test/manifests/${att##*:}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+          | jq -e '[.layers[].annotations["dev.sigstore.cosign/rfc3161timestamp"] // empty] | length == 2' \
+            > /dev/null \
+            && echo "RFC3161 timestamp present on both attestation layers: OK" \
+            || { echo "::error::attestation carries no RFC3161 timestamp — the --timestamp-server-url flag regressed"; exit 1; }
+
+      - name: attest_with_retry failure path (stubbed cosign)
+        run: |
+          set -euo pipefail
+          # Pin the two properties that matter, without a TSA fault injection: a cosign that
+          # always fails is retried exactly max=5 times and then propagates non-zero (so the
+          # per-platform loop aborts rather than shipping an unattested image). Shadow cosign
+          # (counts calls, exits 1) and sleep (no real wait) on PATH; the body mirrors the
+          # public attest_with_retry — same 5-attempt bound and backoff.
+          stub="$(mktemp -d)"
+          printf '#!/usr/bin/env bash\necho x >> "%s/calls"\nexit 1\n' "$stub" > "$stub/cosign"
+          printf '#!/usr/bin/env bash\nexit 0\n' > "$stub/sleep"
+          chmod +x "$stub/cosign" "$stub/sleep"
+          : > "$stub/calls"
+          export PATH="$stub:$PATH"
+          attest_with_retry() {
+            local n=0 max=5 delay=5
+            until cosign attest --yes --type spdxjson --predicate "$1" "$2"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then echo "budget spent after ${max}"; return 1; fi
+              echo "retry ${n}/${max}"; sleep "$delay"; delay=$((delay * 2))
+            done
+          }
+          if attest_with_retry sbom.json localhost/x:1; then
+            echo "::error::attest_with_retry returned 0 though every attempt failed"; exit 1
+          fi
+          calls="$(wc -l < "$stub/calls" | tr -d ' ')"
+          [ "$calls" -eq 5 ] || { echo "::error::expected exactly 5 cosign invocations, got ${calls}"; exit 1; }
+          echo "failure path: exactly 5 invocations + non-zero exit — OK"

@@ -18,6 +18,19 @@ inputs:
     description: 'Environment to authenticate to (production, staging, development)'
     required: false
     default: 'production'
+  attest_tlog:
+    description: >
+      Whether the SBOM attestation is uploaded to the public Rekor transparency
+      log. Default 'false' because this composite is GAR-only (it authenticates
+      with `gcloud auth configure-docker …pkg.dev`), so every ref it attests is a
+      private Artifact Registry coordinate that should not have its path + full
+      SPDX recorded in a public, permanent, append-only log. On 'false' the
+      attestation instead carries an RFC3161 signed timestamp (Sigstore public
+      TSA) so it stays verifiable. Set 'true' only for a genuinely public image
+      (then Rekor provides the timestamp). Keyless signing is unaffected either
+      way; only the transparency-log upload changes.
+    required: false
+    default: 'false'
 
 runs:
   using: "composite"
@@ -36,6 +49,63 @@ runs:
         echo "Overriding IMAGE with: ${{ inputs.image }}"
         echo "IMAGE=${{ inputs.image }}" >> $GITHUB_ENV
 
+    # ----- Supply-chain: SBOM + signed attestation -------------------------
+    # Generate an SPDX SBOM after the push and attach it as a keyless, signed in-toto
+    # attestation (Sigstore, via the job's GitHub OIDC token — no long-lived key), so a
+    # scanner can re-check the released image from its SBOM without pulling it.
+    #
+    # This step only VALIDATES what will be attested (id-token present? refs resolvable?),
+    # so it runs BEFORE build/push: a bad ref (e.g. IMAGE already carries a tag, resolving to
+    # `name:tag:version`) then fails fast with nothing published yet, instead of failing the
+    # publish job over an image that is already live. The actual signing runs after the push.
+    #
+    # What actually gates attestation: the pushed ref must be resolvable — a `print-image-refs`
+    # make target (newline-separated, for repos that push more than one image) or IMAGE +
+    # VERSION. Note the id-token check below is a safety net, NOT the real gate: this composite
+    # authenticates with google-cloud-auth (Workload Identity Federation), which already REQUIRES
+    # id-token: write, so any caller that works at all has it — attestation therefore runs for
+    # every such caller that exposes a ref. The three steps are continue-on-error, so a signing
+    # outage never fails the (already-pushed) publish.
+    - name: Resolve SBOM attest refs
+      id: resolve
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::warning::SBOM attestation skipped: caller job has no 'id-token: write'. Add it (and a print-image-refs target or IMAGE/VERSION env) to enable keyless cosign attestation."
+          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        refs=""
+        if make -n print-image-refs >/dev/null 2>&1; then
+          refs="$(make -s print-image-refs)"
+        elif [ -n "${IMAGE:-}" ] && [ -n "${VERSION:-}" ]; then
+          refs="${IMAGE}:${VERSION}"
+        fi
+        if [ -z "${refs//[[:space:]]/}" ]; then
+          echo "::warning::SBOM attestation skipped: could not determine the pushed image ref (add a 'print-image-refs' make target or set IMAGE and VERSION in the job env)."
+          echo "attest=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        # Validate each ref up front so an unusable one fails HERE, before anything is pushed,
+        # rather than as an opaque syft parse error after the image is already live. Strip any
+        # @digest first (name:tag@sha256:... is a valid pinned reference), then the name
+        # segment (after the last '/') must be `name[:tag]`; a second colon there means IMAGE
+        # already embedded a tag (ref resolves to `name:tag:version`), which syft rejects.
+        while IFS= read -r ref; do
+          [ -n "${ref//[[:space:]]/}" ] || continue
+          seg="${ref##*/}"; seg="${seg%%@*}"; colons="${seg//[^:]/}"
+          if [ "${#colons}" -gt 1 ]; then
+            echo "::error::SBOM attestation: resolved ref '$ref' is not a valid image reference (name segment '${ref##*/}' has an extra colon). Fix 'make print-image-refs' / the IMAGE variable to emit 'registry/repo:tag' — IMAGE likely already carries a tag."
+            exit 1
+          fi
+        done <<< "$refs"
+        {
+          echo "attest=true"
+          echo "refs<<__REFS_EOF__"
+          echo "$refs"
+          echo "__REFS_EOF__"
+        } >> "$GITHUB_OUTPUT"
+
     # TODO: Pin this floating '@main' ref to a tagged release or stable SHA for production safety
     - name: Authenticate to Google Cloud
       uses: PlainsightAI/gh-actions-public/google-cloud-auth@main
@@ -47,8 +117,11 @@ runs:
       run: |
         gcloud auth configure-docker us-west1-docker.pkg.dev
 
+    # SHA-pinned: a caller attesting (id-token: write) runs this composite's steps with the
+    # OIDC token in the environment, so a mutable tag here could mint a Fulcio cert as the
+    # caller. Same reasoning as the google-cloud-auth pins and the filter-release publish job.
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
     - name: Build docker image
       shell: bash
@@ -61,3 +134,98 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         make publish-image
+
+    # ----- Supply-chain: SBOM + signed attestation, continued --------------
+    # These run AFTER the push, in a job holding id-token: write, and cosign signs — so a
+    # compromised mutable tag could mint a Fulcio cert as the caller's identity. Pin by commit
+    # SHA (the load-bearing exception to floating tags): cosign-release pins the cosign binary;
+    # syft-version pins the SBOM generator. Skipped when Resolve found nothing to attest.
+    # continue-on-error: a release-asset download or signing outage must not fail the caller's
+    # publish job over an image that is already live. (Resolve, above, IS allowed to fail — it
+    # runs before build/push, so a bad ref costs nothing.) A soft failure here is not silent:
+    # the "Record SBOM attestation outcome" step below annotates the run and the job summary.
+    - name: Install cosign
+      if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
+      uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      with:
+        cosign-release: v2.5.2
+    - name: Install syft
+      if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
+      uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      with:
+        syft-version: v1.50.0
+    - name: SBOM + keyless attest
+      id: attest
+      if: steps.resolve.outputs.attest == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        ATTEST_TLOG: ${{ inputs.attest_tlog }}
+        REFS: ${{ steps.resolve.outputs.refs }}
+      run: |
+        set -euo pipefail
+        # attest_tlog=false (the default here — see the input) skips the public transparency-log
+        # upload so a private GAR ref + its SBOM aren't recorded in a public log. But Rekor is
+        # also cosign's trusted timestamp: without it, the ~10-minute Fulcio cert can't be proven
+        # valid at signing time, so a verifier rejects the attestation on expiry. So when skipping
+        # the log we attach an RFC3161 signed timestamp from the Sigstore public TSA. To VERIFY
+        # such an attestation the verifier needs BOTH flags together:
+        #     cosign verify-attestation --insecure-ignore-tlog --use-signed-timestamps …
+        # --insecure-ignore-tlog skips the Rekor lookup for an entry that deliberately does not
+        # exist; --use-signed-timestamps then supplies trusted time from the RFC3161 stamp.
+        # --use-signed-timestamps ALONE is not enough — cosign still requires a Rekor entry and
+        # fails "signature not found in transparency log". attest_tlog=true (public images) keeps
+        # the Rekor path and verifies with neither flag.
+        tlog_flag=()
+        if [ "$ATTEST_TLOG" = "false" ]; then
+          tlog_flag=(--tlog-upload=false --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp)
+        fi
+        # Bounded retry around cosign attest. On attest_tlog=false, cosign's TSA client is a
+        # single request with a 10s timeout and no retry, so a transient timestamp.sigstore.dev
+        # blip would otherwise fail attestation. Safe to retry: the TSA timestamp is fetched
+        # during signing, before the attestation is pushed, so a failure leaves nothing behind,
+        # and the scanner dedupes so a duplicate from a late-failure retry is harmless. Backoff
+        # 5,10,20,40s; a genuine non-transient error still fails after exhausting the budget.
+        attest_with_retry() {
+          local n=0 max=5 delay=5
+          until cosign attest --yes "${tlog_flag[@]}" --type spdxjson --predicate sbom.spdx.json "$1"; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "::error::cosign attest failed after ${max} attempts for $1"; return 1
+            fi
+            echo "::warning::cosign attest failed (attempt ${n}/${max}) for $1 — retrying in ${delay}s"
+            sleep "$delay"; delay=$((delay * 2))
+          done
+        }
+        # This wraps `make publish-image` and does not know the built platforms, so it
+        # catalogs one SBOM per ref — the host platform of a manifest-list. It assumes
+        # single-platform images (see the README); a multi-arch image would attest only one
+        # architecture. syft catalogs the image at $ref.
+        while IFS= read -r ref; do
+          [ -n "${ref//[[:space:]]/}" ] || continue
+          echo "Attesting SBOM for $ref"
+          syft "$ref" -o spdx-json=sbom.spdx.json
+          # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
+          attest_with_retry "$ref"
+        done <<< "$REFS"
+    # The three steps above are continue-on-error so an already-pushed image never fails the
+    # publish job — but a green job that shipped an UNATTESTED image must not look identical to
+    # one that attested. Read the attest step's outcome and, when it isn't success, emit a
+    # ::warning:: (annotates the run) plus a job-summary line, so the gap is visible without
+    # blocking the publish. `if: always()` so it runs even though a prior step "failed".
+    - name: Record SBOM attestation outcome
+      if: always() && steps.resolve.outputs.attest == 'true'
+      shell: bash
+      env:
+        ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+        REFS: ${{ steps.resolve.outputs.refs }}
+      run: |
+        set -euo pipefail
+        if [ "$ATTEST_OUTCOME" = "success" ]; then
+          echo "✅ SBOM attestation attached for: ${REFS//$'\n'/, }" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "::warning::SBOM attestation did NOT complete (step outcome: ${ATTEST_OUTCOME:-skipped}); the image was published WITHOUT a signed SBOM attestation. See the 'SBOM + keyless attest' step log."
+          echo "⚠️ SBOM attestation FAILED (outcome: ${ATTEST_OUTCOME:-skipped}) — image published WITHOUT a signed SBOM: ${REFS//$'\n'/, }" >> "$GITHUB_STEP_SUMMARY"
+        fi
