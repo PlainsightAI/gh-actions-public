@@ -167,8 +167,13 @@ runs:
           [ -n "${ref//[[:space:]]/}" ] || continue
           base="${ref%@*}"                      # strip a pinned @digest
           seg="${base##*/}"                     # last path segment: name[:tag]
-          latest="${base%/*}/${seg%:*}:latest"  # swap only the LAST segment's :tag for :latest, so
-                                                # a registry :port (host:443/...) is never mistaken for a tag
+          name="${seg%:*}"                      # swap only the LAST segment's :tag, so a registry
+                                                # :port (host:443/...) is never mistaken for a tag
+          if [ "$base" = "$seg" ]; then
+            latest="$name:latest"               # bare ref with no registry/namespace (no '/')
+          else
+            latest="${base%/*}/$name:latest"    # keep the path prefix intact
+          fi
           echo "Tagging $base -> $latest"
           docker buildx imagetools create --tag "$latest" "$base"
         done <<< "$REFS"
