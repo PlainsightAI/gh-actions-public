@@ -165,8 +165,10 @@ runs:
         fi
         while IFS= read -r ref; do
           [ -n "${ref//[[:space:]]/}" ] || continue
-          base="${ref%@*}"           # strip @digest if pinned
-          latest="${base%:*}:latest" # %:* drops the :tag (the last colon), not a registry port
+          base="${ref%@*}"                      # strip a pinned @digest
+          seg="${base##*/}"                     # last path segment: name[:tag]
+          latest="${base%/*}/${seg%:*}:latest"  # swap only the LAST segment's :tag for :latest, so
+                                                # a registry :port (host:443/...) is never mistaken for a tag
           echo "Tagging $base -> $latest"
           docker buildx imagetools create --tag "$latest" "$base"
         done <<< "$REFS"

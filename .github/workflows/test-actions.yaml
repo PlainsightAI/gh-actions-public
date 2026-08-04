@@ -146,3 +146,19 @@ jobs:
           calls="$(wc -l < "$stub/calls" | tr -d ' ')"
           [ "$calls" -eq 5 ] || { echo "::error::expected exactly 5 cosign invocations, got ${calls}"; exit 1; }
           echo "failure path: exactly 5 invocations + non-zero exit — OK"
+
+      - name: tag_latest :latest derivation (unit)
+        run: |
+          set -euo pipefail
+          # Mirror the composite's :latest derivation and lock in the ref shapes — especially the
+          # combined registry-port + pinned-digest case a naive ${base%:*} gets wrong (it would
+          # strip the port instead of the tag). Same formula as publish-docker-image/action.yaml.
+          derive() { local ref="$1" base seg; base="${ref%@*}"; seg="${base##*/}"; echo "${base%/*}/${seg%:*}:latest"; }
+          check() { local got; got="$(derive "$1")"; [ "$got" = "$2" ] \
+            && echo "PASS: $1 -> $got" \
+            || { echo "::error::derive '$1' = '$got', expected '$2'"; exit 1; }; }
+          check "us-west1-docker.pkg.dev/proj/oci/name:1.2.3"          "us-west1-docker.pkg.dev/proj/oci/name:latest"
+          check "localhost:5000/attest-test:v1"                        "localhost:5000/attest-test:latest"
+          check "us-west1-docker.pkg.dev/proj/oci/name:1.2.3@sha256:a" "us-west1-docker.pkg.dev/proj/oci/name:latest"
+          check "host:443/repo/image@sha256:def"                      "host:443/repo/image:latest"
+          echo "all :latest derivations correct (incl. port + digest)"
