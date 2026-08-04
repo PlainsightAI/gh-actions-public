@@ -29,17 +29,21 @@ After the push, the action attaches a signed SPDX SBOM to the image as a keyless
 attestation (via the job's GitHub OIDC token — no long-lived key), so a scanner can re-check
 the released image from its SBOM without pulling it.
 
-It is **opt-in and non-breaking** — it no-ops with a warning unless the caller enables it:
+**What gates it:** the pushed image reference must be resolvable — expose it via a
+`print-image-refs` make target (newline-separated, one line per image — best for repos that
+push more than one), or set `IMAGE` and `VERSION` in the job environment (`IMAGE:VERSION` is
+then attested):
 
-1. Grant the job `permissions: id-token: write` (keyless cosign needs the OIDC token).
-2. Expose the pushed image reference(s) via a `print-image-refs` make target (newline-separated,
-   one line per image — best for repos that push more than one), or set `IMAGE` and `VERSION`
-   in the job environment (`IMAGE:VERSION` is then attested):
+```makefile
+print-image-refs:
+	@echo $(IMAGE):$(VERSION)
+```
 
-   ```makefile
-   print-image-refs:
-   	@echo $(IMAGE):$(VERSION)
-   ```
+Attestation also needs the job to hold `permissions: id-token: write` for keyless cosign — but
+this action authenticates with Workload Identity Federation, which already requires it, so any
+caller that works at all has it. In practice attestation runs for **every** caller that exposes
+a ref; the id-token check is a safety net, not an opt-in switch. The attest steps are
+`continue-on-error`, so a signing outage never fails the (already-pushed) publish.
 
 The action **assumes single-platform images** — it wraps `make publish-image` and does not know
 the built platforms, so a multi-arch image would have only one architecture cataloged.

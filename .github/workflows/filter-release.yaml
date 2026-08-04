@@ -628,6 +628,20 @@ jobs:
         run: |
           set -euo pipefail
           REF="${IMAGE}:${VERSION}"
+          # Bounded retry around cosign attest. This is the Rekor path (public images), but
+          # Fulcio and Rekor can both flake, and this step is continue-on-error, so a flake
+          # would otherwise ship a public release with no attestation behind a warning nobody
+          # reads. Same shape/reasoning as the composite's attest_with_retry; backoff 5/10/20/40s,
+          # a genuine error still fails after the budget.
+          attest_with_retry() {
+            local n=0 max=5 delay=5
+            until cosign attest --yes --type spdxjson --predicate "$1" "$2"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then echo "::error::cosign attest failed after ${max} attempts for $2"; return 1; fi
+              echo "::warning::cosign attest failed (attempt ${n}/${max}) for $2 — retrying in ${delay}s"
+              sleep "$delay"; delay=$((delay * 2))
+            done
+          }
           # syft against a manifest-list tag only catalogs one platform, so
           # multi-arch images need one SBOM per target platform. Each is attested
           # to the same (index) digest; the scanner reads every spdxjson attestation.
@@ -638,7 +652,7 @@ jobs:
             sbom="sbom.$(echo "$plat" | tr '/' '-').spdx.json"
             syft "${REF}" --platform "${plat}" -o spdx-json="${sbom}"
             # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
-            cosign attest --yes --type spdxjson --predicate "${sbom}" "${REF}"
+            attest_with_retry "${sbom}" "${REF}"
           done
       # Because the attest step is continue-on-error, a green publish-docker job could have
       # shipped an image with no (or, since `set -euo pipefail` aborts the loop mid-way, only

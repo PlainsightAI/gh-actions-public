@@ -49,7 +49,7 @@ runs:
         echo "Overriding IMAGE with: ${{ inputs.image }}"
         echo "IMAGE=${{ inputs.image }}" >> $GITHUB_ENV
 
-    # ----- Supply-chain: SBOM + signed attestation (opt-in) -----------------
+    # ----- Supply-chain: SBOM + signed attestation -------------------------
     # Generate an SPDX SBOM after the push and attach it as a keyless, signed in-toto
     # attestation (Sigstore, via the job's GitHub OIDC token — no long-lived key), so a
     # scanner can re-check the released image from its SBOM without pulling it.
@@ -59,10 +59,13 @@ runs:
     # `name:tag:version`) then fails fast with nothing published yet, instead of failing the
     # publish job over an image that is already live. The actual signing runs after the push.
     #
-    # Opt-in and non-breaking: if the caller granted no id-token, or exposes no ref, this warns
-    # and skips — and the installs/attest below skip too. A repo enables coverage by granting
-    # `permissions: id-token: write` AND exposing its pushed ref(s): a `print-image-refs` make
-    # target (newline-separated, for repos that push more than one image) or IMAGE + VERSION.
+    # What actually gates attestation: the pushed ref must be resolvable — a `print-image-refs`
+    # make target (newline-separated, for repos that push more than one image) or IMAGE +
+    # VERSION. Note the id-token check below is a safety net, NOT the real gate: this composite
+    # authenticates with google-cloud-auth (Workload Identity Federation), which already REQUIRES
+    # id-token: write, so any caller that works at all has it — attestation therefore runs for
+    # every such caller that exposes a ref. The three steps are continue-on-error, so a signing
+    # outage never fails the (already-pushed) publish.
     - name: Resolve SBOM attest refs
       id: resolve
       shell: bash
@@ -114,8 +117,11 @@ runs:
       run: |
         gcloud auth configure-docker us-west1-docker.pkg.dev
 
+    # SHA-pinned: a caller attesting (id-token: write) runs this composite's steps with the
+    # OIDC token in the environment, so a mutable tag here could mint a Fulcio cert as the
+    # caller. Same reasoning as the google-cloud-auth pins and the filter-release publish job.
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v4
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
     - name: Build docker image
       shell: bash
