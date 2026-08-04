@@ -147,9 +147,11 @@ runs:
       run: |
         make publish-image
 
-    # Opt-in :latest. `make build-image` tagged each ref locally, so we just retag → push
-    # <registry>/<name>:latest for every resolved ref. Fails loudly if tag_latest was requested
-    # but no ref resolved, rather than silently skipping.
+    # Opt-in :latest. Copy each just-pushed versioned tag to :latest with
+    # `docker buildx imagetools create` — registry-to-registry, so it needs NO local image (a
+    # `docker buildx build --push` caller never populates the local daemon store, so a plain
+    # `docker tag` would fail "No such image") and it preserves a multi-arch manifest list.
+    # Fails loudly if tag_latest was requested but no ref resolved, rather than silently skipping.
     - name: Tag and push :latest
       if: inputs.tag_latest == 'true'
       shell: bash
@@ -166,8 +168,7 @@ runs:
           base="${ref%@*}"           # strip @digest if pinned
           latest="${base%:*}:latest" # %:* drops the :tag (the last colon), not a registry port
           echo "Tagging $base -> $latest"
-          docker tag "$base" "$latest"
-          docker push "$latest"
+          docker buildx imagetools create --tag "$latest" "$base"
         done <<< "$REFS"
 
     # ----- Supply-chain: SBOM + signed attestation, continued --------------

@@ -10,7 +10,7 @@ Builds and publishes a Docker image to Google Artifact Registry (GAR). This acti
 | `image`      | Override the default Docker image path (e.g., `gcr.io/...`)                 | ❌        | `""`          |
 | `environment`| Environment for GCP Workload Identity (`production`, `staging`, `development`) | ❌    | `"production"`|
 | `attest_tlog`| Upload the SBOM attestation to the public Rekor transparency log. Defaults to `'false'` because this action is GAR-only — every ref it attests is a private Artifact Registry coordinate that should not land in a public log; on `'false'` the attestation carries an RFC3161 signed timestamp instead so it stays verifiable. Set `'true'` only for a genuinely public image. | ❌ | `"false"` |
-| `tag_latest` | Also tag and push `<image>:latest` alongside the versioned tag (mirrors `publish-gar-image`), so callers don't need their own `docker tag`/`docker push :latest` step. Needs a resolvable ref (`print-image-refs` target or `IMAGE`+`VERSION`), same as attestation. | ❌ | `"false"` |
+| `tag_latest` | Also tag `<image>:latest` alongside the versioned tag (mirrors `publish-gar-image`), so callers don't need their own `:latest` step. Created **registry-to-registry** with `docker buildx imagetools create` — no dependency on the image being in the local daemon (a `buildx --push` build never populates it) and multi-arch manifests are preserved. Needs a resolvable ref (`print-image-refs` target or `IMAGE`+`VERSION`), same as attestation. | ❌ | `"false"` |
 
 ## Prerequisites
 
