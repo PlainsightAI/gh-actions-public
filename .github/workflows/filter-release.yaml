@@ -522,6 +522,12 @@ jobs:
       # secrets: inherit, we resolve each via toJson(secrets) and write to
       # $GITHUB_ENV with masking. Mirrors the same step in
       # filter-release-premium.yaml.
+      #
+      # Unlike dry-run-publish (which tolerates a missing secret so fork/PR
+      # builds still run), this is the real release publish: a forwarded secret
+      # that resolves empty means a misconfigured secret, and shipping an image
+      # built without it (e.g. HF-gated weights not baked in) would defer the
+      # failure to runtime. Fail loudly instead.
       - name: Forward inherited secrets to env
         if: inputs.forward_secrets_as_env != ''
         env:
@@ -532,7 +538,7 @@ jobs:
           for name in "${names[@]}"; do
             name="${name//[[:space:]]/}"; [ -z "$name" ] && continue
             value=$(printf '%s' "$ALL_SECRETS" | jq -r --arg k "$name" '.[$k] // ""')
-            [ -z "$value" ] && { echo "::warning::secret '$name' listed in forward_secrets_as_env but not found in inherited secrets context"; continue; }
+            [ -z "$value" ] && { echo "::error::secret '$name' listed in forward_secrets_as_env resolved empty during release publish; refusing to ship an image built without it"; exit 1; }
             echo "::add-mask::$value"
             delim="ghsecret_$(openssl rand -hex 8)"
             { echo "${name}<<${delim}"; printf '%s\n' "$value"; echo "$delim"; } >> "$GITHUB_ENV"
