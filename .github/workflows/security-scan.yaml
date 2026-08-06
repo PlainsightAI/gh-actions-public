@@ -3,8 +3,19 @@ name: Security Scan
 on:
   workflow_call:
     inputs:
+      language:
+        description: >-
+          Ecosystem of the repo being scanned. `python` (default) sets up Python and runs
+          `make install` so the resolved dependency tree is on disk before Grype scans it,
+          once per `python_versions`. `go` (or any non-python value) skips that Python setup
+          and scans the source tree directly (Grype reads go.mod/go.sum natively), a single
+          time. The Grype run, the ignore/CVE-policy merge, and `--fail-on` are shared across
+          both, so there is one source of truth for the CVE policy (no per-language drift).
+        required: false
+        type: string
+        default: python
       python_versions:
-        description: JSON array of Python versions to scan
+        description: JSON array of Python versions to scan (ignored unless language=python)
         required: false
         type: string
         default: '["3.10", "3.11", "3.12", "3.13"]'
@@ -51,7 +62,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ${{ fromJSON(inputs.python_versions) }}
+        # Per Python version when language=python; a single run otherwise (the version is
+        # irrelevant to a go.mod/source scan).
+        python: ${{ fromJSON(inputs.language == 'python' && inputs.python_versions || '["-"]') }}
     steps:
       - name: "PreAction Disk-Cleanup"
         run: |
@@ -62,10 +75,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      # Python is needed to (a) install deps for a python repo, and (b) run the ignore/CVE
+      # merge script below. Skip it for a non-python repo that passes no ignore_cves.
       - name: Set up Python
+        if: inputs.language == 'python' || inputs.ignore_cves != ''
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ inputs.language == 'python' && matrix.python || '3.12' }}
 
       - name: Authenticate to Google Cloud
         if: inputs.gcloud_auth
@@ -78,7 +94,10 @@ jobs:
         if: inputs.gcloud_auth
         uses: google-github-actions/setup-gcloud@v3
 
+      # Python only: install the resolved dependency tree so `grype dir:.` sees it. A go.mod
+      # repo needs nothing here — Grype reads go.mod/go.sum from the checkout directly.
       - name: Create virtual environment and install dependencies
+        if: inputs.language == 'python'
         run: |
           python -m venv venv
           source venv/bin/activate
