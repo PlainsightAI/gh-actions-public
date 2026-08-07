@@ -164,3 +164,65 @@ jobs:
           check "host:443/repo/image@sha256:def"                      "host:443/repo/image:latest"
           check "image:v1"                                            "image:latest"
           echo "all :latest derivations correct (incl. port + digest + bare ref)"
+
+  # Drives the attest-sbom composite end to end: build a throwaway MULTI-ARCH image, push it
+  # to a local registry, invoke the action, and assert it attached one verifiable SPDX SBOM
+  # attestation PER PLATFORM. Uses tlog=false + allow-http-registry so it needs no Rekor and
+  # no real registry (mirrors how the released image is scanned: one predicate per arch).
+  attest-sbom-action:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # keyless cosign (Fulcio)
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      REF: localhost:5000/attest-sbom-test:v1
+      PLATFORMS: linux/amd64,linux/arm64
+    steps:
+      - name: Checkout so the local ./attest-sbom action resolves
+        uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: network=host
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v2.5.2
+      - name: Build and push a throwaway multi-arch image
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          printf 'FROM alpine:3.20\nRUN echo attest-sbom-test\n' > ctx/Dockerfile
+          docker buildx build --platform "$PLATFORMS" -t "$REF" --push ctx
+      - name: Attest via the composite (tlog=false + local registry)
+        uses: ./attest-sbom
+        with:
+          image: ${{ env.REF }}
+          platforms: linux/amd64,linux/arm64
+          tlog: "false"
+          allow-http-registry: "true"
+      - name: Assert one verifiable SPDX attestation PER platform
+        run: |
+          set -euo pipefail
+          # Both per-platform attestations must land on the one index digest.
+          n="$(cosign download attestation --allow-http-registry \
+                 --predicate-type=https://spdx.dev/Document "$REF" \
+               | jq -s '[.[] | .payload | @base64d | fromjson
+                        | select(.predicateType=="https://spdx.dev/Document")] | length')"
+          echo "attestations attached: $n"
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 per-platform attestations, got $n"; exit 1; }
+          # VERIFY (not just download): tlog=false needs BOTH flags (see publish-docker-image-attest).
+          cosign verify-attestation --type spdxjson --allow-http-registry \
+            --insecure-ignore-tlog --use-signed-timestamps \
+            --certificate-identity-regexp "^https://github\.com/PlainsightAI/gh-actions-public/\.github/workflows/test-actions\.yaml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REF" > /dev/null \
+            && echo "attest-sbom verify OK" \
+            || { echo "::error::attest-sbom verify-attestation failed"; exit 1; }

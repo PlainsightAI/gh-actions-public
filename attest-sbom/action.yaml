@@ -1,0 +1,105 @@
+name: "Attest SBOM"
+description: >-
+  Attach a keyless cosign SBOM attestation (SPDX, one per platform) to an image that has
+  ALREADY been built and pushed. Unlike publish-docker-image (which builds+pushes to GAR),
+  this only signs an existing ref, so it composes with any build — e.g. a native per-arch
+  build-and-push + `docker buildx imagetools create` merge that pushes a multi-arch manifest
+  to Docker Hub. The caller must already be authenticated to the image's registry (the same
+  login it used to push) and hold `permissions: id-token: write` for keyless signing.
+
+inputs:
+  image:
+    description: >-
+      Full reference of the already-pushed image to attest, e.g.
+      `plainsightai/plainsight-deployment-agent:1.2.3`. For a multi-arch manifest, pass the
+      tag: the attestation attaches to the manifest-list digest, one SPDX predicate per
+      platform below (which is what the released-image scanner expects).
+    required: true
+  platforms:
+    description: >-
+      Comma-separated platforms to catalog. syft generates one SBOM per platform and cosign
+      attests each to the image, so a multi-arch release carries a per-arch SBOM. Must match
+      (or be a subset of) the platforms actually present in the manifest.
+    required: false
+    default: "linux/amd64,linux/arm64"
+  tlog:
+    description: >-
+      Upload the attestation to the public Rekor transparency log. `'true'` for PUBLIC images
+      (e.g. Docker Hub) — Rekor supplies the trusted timestamp, verify needs no extra flags.
+      `'false'` for PRIVATE registries — attaches an RFC3161 signed timestamp instead (verify
+      with `--insecure-ignore-tlog --use-signed-timestamps`).
+    required: false
+    default: "true"
+  cosign-version:
+    description: "cosign release to install (pinned so a rebuild signs identically)."
+    required: false
+    default: "v2.5.2"
+  syft-version:
+    description: "syft version to install (pins the SBOM generator)."
+    required: false
+    default: "v1.50.0"
+  allow-http-registry:
+    description: >-
+      Allow a plaintext-HTTP registry (adds `--allow-http-registry` to cosign and
+      `SYFT_REGISTRY_INSECURE_USE_HTTP` for syft). For a local test registry only — never
+      set this for a real (HTTPS) registry.
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    # SHA-pinned (the load-bearing exception to floating tags): these two installers run in a
+    # job holding id-token: write and cosign is the tool that decides whether a bad signature
+    # is caught, so a compromised installer could mint an accepted signer. Bump deliberately.
+    - name: Install cosign
+      uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      with:
+        cosign-release: ${{ inputs.cosign-version }}
+    - name: Install syft
+      uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      with:
+        syft-version: ${{ inputs.syft-version }}
+
+    - name: SBOM + keyless attest (per platform)
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        PLATFORMS: ${{ inputs.platforms }}
+        TLOG: ${{ inputs.tlog }}
+        ALLOW_HTTP: ${{ inputs.allow-http-registry }}
+      run: |
+        set -euo pipefail
+        http_flag=()
+        if [ "$ALLOW_HTTP" = "true" ]; then
+          http_flag=(--allow-http-registry)
+          export SYFT_REGISTRY_INSECURE_USE_HTTP=true
+        fi
+        # Bounded retry: Rekor / the RFC3161 TSA are single network calls with no internal
+        # retry, so a blip would otherwise drop an image's attestation. 5 attempts, 5→80s.
+        attest_with_retry() {
+          local n=0 max=5 delay=5
+          until cosign attest --yes --type spdxjson "${http_flag[@]}" "$@"; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then echo "::error::cosign attest failed after ${max} attempts"; return 1; fi
+            echo "::warning::cosign attest failed (attempt ${n}/${max}) — retrying in ${delay}s"
+            sleep "$delay"; delay=$((delay * 2))
+          done
+        }
+        IFS=',' read -ra PLATS <<< "$PLATFORMS"
+        for plat in "${PLATS[@]}"; do
+          plat="${plat//[[:space:]]/}"; [ -z "$plat" ] && continue
+          sbom="sbom.$(echo "$plat" | tr '/' '-').spdx.json"
+          syft "$IMAGE" --platform "$plat" -o spdx-json="$sbom"
+          if [ "$TLOG" = "true" ]; then
+            # Public: upload to Rekor (default). Rekor is the trusted timestamp; verify needs no flags.
+            attest_with_retry --predicate "$sbom" "$IMAGE"
+          else
+            # Private: no Rekor entry; attach an RFC3161 signed timestamp so the ~10-min Fulcio
+            # cert is provable at signing time. Verify with --insecure-ignore-tlog --use-signed-timestamps.
+            attest_with_retry --tlog-upload=false \
+              --timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp \
+              --predicate "$sbom" "$IMAGE"
+          fi
+          echo "attested $IMAGE ($plat)"
+        done
