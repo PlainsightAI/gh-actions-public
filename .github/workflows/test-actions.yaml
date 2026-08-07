@@ -226,3 +226,19 @@ jobs:
             "$REF" > /dev/null \
             && echo "attest-sbom verify OK" \
             || { echo "::error::attest-sbom verify-attestation failed"; exit 1; }
+
+  # Exercises the security-scan.yaml reusable on the language=go path end to end: it MUST skip
+  # the Python machinery (setup-python / venv / make install) and scan the checkout with
+  # `grype dir:.`, which reads the testdata/go-scan-fixture/go.mod cataloger. The fixture has no
+  # dependencies, so the run is deterministic (zero findings → pass) and never flakes on Grype DB
+  # changes. If the language gate regressed and the Python steps ran on this (Makefile-less,
+  # go.mod-only) tree, `make install` would fail — so this is a real guard, not just smoke.
+  security-scan-go:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/security-scan.yaml
+    with:
+      language: go
+      fail_on: critical
+      only_fixed: true
