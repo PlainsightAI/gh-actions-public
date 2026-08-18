@@ -249,7 +249,12 @@ runs:
         while IFS= read -r ref; do
           [ -n "${ref//[[:space:]]/}" ] || continue
           echo "Attesting SBOM for $ref"
-          syft "$ref" -o spdx-json=sbom.spdx.json
+          # `registry:` forces syft to pull the image straight from the registry using the
+          # ambient docker credential (gcloud configure-docker above), instead of a bare ref
+          # that resolves local docker/containerd first — which on the runner has no daemon
+          # access and falls back to an UNAUTHENTICATED registry pull (DENIED on private GAR),
+          # publishing the image with no SBOM attestation. Mirrors publish-gar-image.
+          syft "registry:$ref" -o spdx-json=sbom.spdx.json
           # --type spdxjson sets predicateType https://spdx.dev/Document (scanner filter).
           attest_with_retry "$ref"
         done <<< "$REFS"
