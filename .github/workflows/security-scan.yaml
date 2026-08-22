@@ -7,18 +7,35 @@ on:
         description: >-
           Ecosystem of the repo being scanned. `python` (default) sets up Python and runs
           `make install` so the resolved dependency tree is on disk before Grype scans it,
-          once per `python_versions`. `go` (or any non-python value) skips that Python setup
-          and scans the source tree directly (Grype reads go.mod/go.sum natively), a single
-          time. The Grype run, the ignore/CVE-policy merge, and `--fail-on` are shared across
-          both, so there is one source of truth for the CVE policy (no per-language drift).
+          once per resolved Python version. `go` (or any non-python value) skips that Python
+          setup and scans the source tree directly (Grype reads go.mod/go.sum natively), a
+          single time. The Grype run, the ignore/CVE-policy merge, and `--fail-on` are shared
+          across both, so there is one source of truth for the CVE policy (no per-language drift).
         required: false
         type: string
         default: python
       python_versions:
-        description: JSON array of Python versions to scan (ignored unless language=python)
+        description: >-
+          Explicit JSON array of Python versions to scan (ignored unless language=python).
+          Leave empty (the default) to DERIVE the matrix from the repo's own `requires-python`
+          in pyproject.toml, clamped to [python_floor, python_ceiling] — so each repo scans
+          exactly the versions it supports with no per-repo override to keep in sync. Pass an
+          explicit array only to override that (e.g. a service with no pyproject.toml).
         required: false
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13"]'
+        default: ''
+      python_floor:
+        description: Lowest Python minor to scan when deriving from requires-python (e.g. "3.10").
+        required: false
+        type: string
+        default: '3.10'
+      python_ceiling:
+        description: >-
+          Highest Python minor to scan when deriving. Bump this in ONE place when a new Python
+          ships and every consumer whose requires-python allows it picks it up fleet-wide.
+        required: false
+        type: string
+        default: '3.14'
       grype_version:
         description: Grype version to use
         required: false
@@ -57,14 +74,63 @@ permissions:
   id-token: write
 
 jobs:
+  # Resolve the Python matrix once, up front. For a python repo that passes no explicit
+  # python_versions, derive it from the repo's own requires-python (clamped to
+  # [python_floor, python_ceiling]) so each repo scans exactly the versions it supports —
+  # nothing to keep in sync per repo, and a new Python is picked up fleet-wide by bumping
+  # python_ceiling. An explicit python_versions input overrides the derivation (e.g. a
+  # service with no pyproject.toml). Non-python repos resolve to a single ["-"] run.
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.derive.outputs.versions }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Derive Python matrix
+        id: derive
+        shell: bash
+        env:
+          LANGUAGE: ${{ inputs.language }}
+          OVERRIDE: ${{ inputs.python_versions }}
+          FLOOR: ${{ inputs.python_floor }}
+          CEILING: ${{ inputs.python_ceiling }}
+        run: |
+          if [ "$LANGUAGE" != "python" ]; then
+            echo 'versions=["-"]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -n "$OVERRIDE" ]; then
+            echo "versions=$OVERRIDE" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, os, json
+          floor_i = int(os.environ["FLOOR"].split(".")[1])
+          ceil_i = int(os.environ["CEILING"].split(".")[1])
+          rp = ""
+          try:
+              with open("pyproject.toml") as fh:
+                  m = re.search(r'''requires-python\s*=\s*["']([^"']+)''', fh.read())
+                  rp = m.group(1) if m else ""
+          except FileNotFoundError:
+              pass
+          fm = re.search(r'>=\s*3\.(\d+)', rp)
+          cm = re.search(r'<\s*3\.(\d+)', rp)
+          lo = max(int(fm.group(1)) if fm else floor_i, floor_i)
+          hi = min((int(cm.group(1)) - 1) if cm else ceil_i, ceil_i)
+          versions = [f"3.{n}" for n in range(lo, hi + 1)] or [f"3.{ceil_i}"]
+          print("versions=" + json.dumps(versions))
+          PY
+
   grype:
+    needs: resolve-matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Per Python version when language=python; a single run otherwise (the version is
-        # irrelevant to a go.mod/source scan).
-        python: ${{ fromJSON(inputs.language == 'python' && inputs.python_versions || '["-"]') }}
+        # Resolved by the resolve-matrix job: the derived (or explicitly overridden) Python
+        # versions for a python repo, or a single ["-"] run for a go.mod/source scan.
+        python: ${{ fromJSON(needs.resolve-matrix.outputs.versions) }}
     steps:
       - name: "PreAction Disk-Cleanup"
         run: |
