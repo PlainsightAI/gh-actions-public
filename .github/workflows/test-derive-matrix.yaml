@@ -1,0 +1,33 @@
+name: Test derive-python-matrix
+
+# Unit-tests the security-scan matrix derivation (scripts/derive_python_matrix.py), which
+# mirrors the inline logic in security-scan.yaml's resolve-matrix job.
+
+on:
+  pull_request:
+    paths:
+      - scripts/derive_python_matrix.py
+      - scripts/test_derive_python_matrix.py
+      - .github/workflows/security-scan.yaml
+      - .github/workflows/test-derive-matrix.yaml
+  push:
+    branches: [main]
+    paths:
+      - scripts/derive_python_matrix.py
+      - scripts/test_derive_python_matrix.py
+      - .github/workflows/security-scan.yaml
+      - .github/workflows/test-derive-matrix.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet packaging
+      - run: python3 scripts/test_derive_python_matrix.py
