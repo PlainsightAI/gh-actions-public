@@ -131,6 +131,20 @@ concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # openfilter's runtime reports a usage event to Scarf from Filter.__init__, so
+  # every filter a test constructs emits one. `make test` instantiates filters
+  # repeatedly on every PR and every release, across every filter repo that calls
+  # this workflow, which drowns real adoption signal in our own CI traffic.
+  #
+  # Set at workflow level rather than on run-tests alone so a job added later
+  # that happens to run a filter is covered by default. This is CI-only: the
+  # example docker-compose files these repos ship are what users copy, and they
+  # deliberately keep openfilter's opt-out default so a real install still counts.
+  #
+  # Mirrors what openfilter's own repo already does in .github/workflows/ci.yaml.
+  DO_NOT_TRACK: "true"
+
 jobs:
   check-release-log:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
