@@ -242,6 +242,23 @@ runs:
             sleep "$delay"; delay=$((delay * 2))
           done
         }
+        # Free disk before cataloguing. `registry:` below makes syft pull the image's
+        # layers into its own cache under $TMPDIR, which for an image that bakes model
+        # weights is several GB on top of whatever the build already left behind. On a
+        # standard GitHub-hosted runner that is enough to exhaust the disk, and syft then
+        # reports `unable to populate layer cache ... no space left on device`, falls
+        # through its remaining providers, and the image ships with no SBOM attestation
+        # (the step is continue-on-error, so the job still goes green -- see the outcome
+        # step below).
+        #
+        # Only the build cache is worth reclaiming here: `make publish-image` builds with
+        # `docker buildx build --push`, which never populates the local daemon store, so
+        # there is no built image to remove. The buildx driver is `docker-container`, so
+        # its cache lives in the builder's volume and needs `docker builder prune`.
+        docker builder prune -af >/dev/null 2>&1 || true
+        docker image prune -af   >/dev/null 2>&1 || true
+        df -h / 2>/dev/null | tail -1 || true
+
         # This wraps `make publish-image` and does not know the built platforms, so it
         # catalogs one SBOM per ref — the host platform of a manifest-list. It assumes
         # single-platform images (see the README); a multi-arch image would attest only one
