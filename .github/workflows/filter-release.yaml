@@ -171,6 +171,13 @@ jobs:
       matrix:
         python: ${{ fromJSON(inputs.python_versions) }}
     steps:
+      # ubuntu-26.04 mounts /tmp as a RAM-backed tmpfs with a per-user quota
+      # (actions/runner-images#14777). pip's torch/CUDA wheel downloads and syft's
+      # image export both stage there and hit "Disk quota exceeded"; point TMPDIR
+      # at the runner's work disk instead.
+      - name: Keep TMPDIR off the tmpfs /tmp
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v6
 
@@ -197,6 +204,13 @@ jobs:
     needs: run-tests
     runs-on: ubuntu-latest
     steps:
+      # ubuntu-26.04 mounts /tmp as a RAM-backed tmpfs with a per-user quota
+      # (actions/runner-images#14777). pip's torch/CUDA wheel downloads and syft's
+      # image export both stage there and hit "Disk quota exceeded"; point TMPDIR
+      # at the runner's work disk instead.
+      - name: Keep TMPDIR off the tmpfs /tmp
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v6
 
@@ -510,6 +524,13 @@ jobs:
     # stays @main below — it is this repo's own action, so pinning it guards against nothing
     # a push to this repo couldn't already do, and would add a self-referential SHA treadmill.)
     steps:
+      # ubuntu-26.04 mounts /tmp as a RAM-backed tmpfs with a per-user quota
+      # (actions/runner-images#14777). pip's torch/CUDA wheel downloads and syft's
+      # image export both stage there and hit "Disk quota exceeded"; point TMPDIR
+      # at the runner's work disk instead.
+      - name: Keep TMPDIR off the tmpfs /tmp
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
