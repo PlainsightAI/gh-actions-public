@@ -167,6 +167,7 @@ jobs:
 
   run-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         python: ${{ fromJSON(inputs.python_versions) }}
@@ -203,6 +204,7 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     needs: run-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       # ubuntu-26.04 mounts /tmp as a RAM-backed tmpfs with a per-user quota
       # (actions/runner-images#14777). pip's torch/CUDA wheel downloads and syft's
@@ -476,6 +478,7 @@ jobs:
 
   publish-to-pypi:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: prepare-pypi-publish
     if: needs.prepare-pypi-publish.outputs.already_exists == 'false'
     environment:
@@ -504,6 +507,7 @@ jobs:
 
   publish-docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: [create-release, prepare-pypi-publish, publish-to-pypi]
     if: needs.create-release.outputs.is_release_created == 'true' && (needs.publish-to-pypi.result == 'success' || needs.publish-to-pypi.result == 'skipped')
     # id-token: write lets the keyless cosign SBOM attestation steps below mint a
