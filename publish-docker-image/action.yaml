@@ -41,6 +41,20 @@ inputs:
     required: false
     default: 'false'
 
+  disk_cleanup:
+    description: >
+      When 'true', reclaim disk on the runner before the build: delete the preinstalled
+      .NET, Android SDK, GHC and CodeQL toolchains and prune local Docker images and build
+      cache. That freed about 22 GB on an ubuntu-latest runner, taking free space on `/`
+      from ~15 GB to ~37 GB. Needed for an image that bakes large artifacts (model
+      weights, CUDA wheels), which otherwise fails the build with "no space left on
+      device". Default 'false' keeps every existing caller unchanged: the step is
+      destructive to the runner, so a job that uses any of those toolchains after the
+      publish, or that needs a local image an earlier step built and loaded, must leave it
+      off.
+    required: false
+    default: 'false'
+
 runs:
   using: "composite"
   steps:
@@ -128,6 +142,28 @@ runs:
       shell: bash
       run: |
         gcloud auth configure-docker us-west1-docker.pkg.dev
+
+    # Opt-in disk reclaim, placed before anything that consumes disk. A GitHub-hosted
+    # runner starts with roughly 15 GB free on `/`, which an image that bakes large
+    # artifacts (model weights, CUDA wheels) exhausts during the build. The job then dies
+    # with "no space left on device" -- sometimes while the runner is writing its own
+    # diagnostic log, in which case no step is marked failed and the run reads like an
+    # infrastructure flake, though a re-run reproduces it exactly.
+    #
+    # Off by default because it is destructive to the runner, not to the build: a caller
+    # that uses .NET, the Android SDK, GHC or CodeQL later in the SAME job would lose them,
+    # and `docker image prune --all` removes every local image, including one an earlier
+    # step built and loaded for tests. It is safe here only because it runs BEFORE the
+    # build, so `make publish-image` still finds the image it pushes.
+    - name: Free disk space before the build
+      if: inputs.disk_cleanup == 'true'
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo docker builder prune -a --force
+        df -h /
 
     # SHA-pinned: a caller attesting (id-token: write) runs this composite's steps with the
     # OIDC token in the environment, so a mutable tag here could mint a Fulcio cert as the
